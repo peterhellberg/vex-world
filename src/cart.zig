@@ -646,7 +646,7 @@ fn drawOverview() void {
 
     vex.rect(0, HUD_Y, vex.WIDTH, vex.HEIGHT - HUD_Y, C.ui_bg);
     vex.text(say("SEED {X}  MAP {d}x{d}", .{ seed, MAP_W, MAP_H }), 4, HUD_Y + 2, C.ui_text);
-    vex.text("ARROWS MOVE BOX   X BACK TO WORLD", 4, HUD_Y + 11, C.ui_dim);
+    vex.text(HINT_MAP, 4, HUD_Y + 11, C.ui_dim);
 }
 
 // -- entropy buckets --------------------------------------------------------
@@ -973,8 +973,20 @@ fn draw() void {
 
     vex.rect(0, HUD_Y, vex.WIDTH, vex.HEIGHT - HUD_Y, C.ui_bg);
     vex.text(say("SEED {X}  {d},{d}  {s}", .{ seed, hx, hy, TILES[hover].name }), 4, HUD_Y + 2, C.ui_text);
-    vex.text("ARROWS SCROLL   HOLD LMB AT EDGE   X OR RMB MAP   Z NEW", 4, HUD_Y + 11, C.ui_dim);
+    vex.text(HINT_SCROLL, 4, HUD_Y + 11, C.ui_dim);
 }
+
+/// Both HUD hint lines, kept as consts so the fit check below sees them and the
+/// two views cannot drift into wording that no longer matches the bindings.
+/// Sized to the 8x8 console font: 39 characters fit between the margins, and the
+/// old scrolling hint was 55, so "RMB MAP   Z NEW" was drawn off-screen and
+/// never rendered. Clipped text does not look clipped -- the line just ends.
+const HINT_SCROLL = "ARROWS/LMB SCROLL   X/RMB MAP   Z NEW";
+const HINT_MAP = "CLICK MOVE BOX   X/RMB WORLD";
+
+/// 8x8 glyphs, per the console font.
+const CHAR_W: i32 = 8;
+const HUD_MARGIN: i32 = 4;
 
 /// Map tile under a click in the 1:1 overview, or null if the click landed off
 /// the map -- on the frame, or on the HUD. Null matters: a click just past the
@@ -1648,4 +1660,24 @@ test "a held mouse button reads as one press, not one per frame" {
         was_down = true;
     }
     try std.testing.expectEqual(@as(usize, 1), presses);
+}
+
+test "every HUD line fits the screen in the 8x8 font" {
+    // A hint line that overruns is not visibly broken. text() clips at the
+    // screen edge, so the line just stops -- "ARROWS SCROLL   HOLD LMB AT EDGE
+    //   X OR RMB MAP   Z NEW" was 55 glyphs against 39 that fit, and the last
+    // sixteen characters were silently dropped, taking the new-world binding
+    // with them. Nothing fails, nothing looks wrong at a glance.
+    //
+    // So the fit is checked, not eyeballed. The seed line is included at its
+    // widest: 8 hex digits, the far-corner coordinate, and the longest tile
+    // name, which is what actually decides whether that line overflows.
+    const cap = (vex.WIDTH - 2 * HUD_MARGIN) / CHAR_W;
+    const seed_line = "SEED FFFFFFFF  319,159  SNOWCAP";
+    inline for (.{ seed_line, HINT_SCROLL, HINT_MAP }) |line| {
+        try std.testing.expect(@as(i32, @intCast(line.len)) <= cap);
+    }
+    // And the font assumption itself, so a console font change fails here rather
+    // than as a silently clipped line much later.
+    try std.testing.expectEqual(@as(i32, 39), cap);
 }
