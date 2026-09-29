@@ -439,17 +439,20 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
                     1 => 5, // even
                     else => 2, // sunlit, mostly showing the grass beneath
                 };
-                // The two forest tiers share this dither and differ only in how
-                // much canopy each patch carries, which is the whole point of
-                // the split: same texture, denser, so the eye reads "deeper
-                // into the trees" rather than "a different green appeared". The
-                // deep tier never shows the grass through, so a whole hillside
-                // of it is unbroken canopy where the tier below is dappled.
-                // Denser canopy in the deep tier: barely any grass left to
-                // show through, so a whole hillside of it is unbroken where
-                // the tier below is dappled.
+                // The two forest tiers share this dither and differ in how much
+                // canopy each patch carries, which is the point of the split:
+                // same texture, denser, so the eye reads "deeper into the
+                // trees" rather than "a different green appeared".
                 const d2: u32 = if (kind == .forest_deep) @min(dark + 4, 10) else dark;
                 c = if (n % 10 < d2) C.forest else C.forest_light;
+                // The deep tier also paints its own darker tone in the gaps
+                // the canopy does not cover. It has to: the tier was 84% plain
+                // `C.forest` with no `C.forest_deep` in it at all, so the
+                // minimap -- which samples the tile's own map colour -- showed
+                // a deep forest that was far darker than the tile it stood for.
+                // The two have to agree, and the shadow is what makes the tier
+                // read as shade rather than as density alone.
+                if (kind == .forest_deep and n % 10 >= d2) c = C.forest_deep;
             },
             // Two rock tiers from one speckle, so the climb reads as one
             // material getting paler rather than two unrelated textures.
@@ -479,7 +482,7 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
                 const vy: u32 = @intCast(yy);
                 const vx: u32 = @intCast(xx);
                 const ridges = 1 + hash(@intCast(variant), 7, 0xBEEF) % 2;
-                c = C.rock_dark; // bare ground between the ridges
+                c = C.peak_ground; // bare ground between the ridges
                 for (0..ridges) |r| {
                     const h = hash(@intCast(r), @intCast(variant), 0xC0FFEE);
                     const cx: u32 = 3 + h % 10; // apex column
@@ -496,7 +499,12 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
                     // into it and the cone reads as a sliver: an earlier
                     // version shaded the left flank with the same dark as the
                     // ground and drew a wedge, not a mountain.
-                    c = if (vx >= cx) C.rock_light else C.rock;
+                    // The exposed summit tone goes on the shadowed flank, not
+                    // the plain rock tone: PEAKS was mapped as C.peak and never
+                    // painted it, so the minimap showed a shade of dark that
+                    // appears nowhere in the tile. The lit flank is a step
+                    // lighter still, which is what gives the cone its slope.
+                    c = if (vx >= cx) C.peak_lit else C.peak;
                 }
             },
             .snow => c = if (n % 9 == 0) C.snow_shade else if (n % 23 == 0) C.snow_tint else C.snow,
@@ -2241,4 +2249,29 @@ test "ruins are rare, spread across the land, and never on the beach" {
         if (c > 0) classes_used += 1;
     }
     try std.testing.expect(classes_used >= 3);
+}
+
+test "every tile's map colour is one its own art actually paints" {
+    // The overview and the minimap both draw `TILES[t].map`, one pixel per
+    // tile, while the world view draws the tile's art. If the map colour is not
+    // among the art's own colours, the same terrain is one shade on the map and
+    // a different one underfoot.
+    //
+    // DEEP FOREST was the case that prompted this: 84% plain forest and not one
+    // pixel of the dark tone it was reported as, so the minimap showed a near
+    // black where the world view showed ordinary deep green. The tier had been
+    // carried by dither density alone and the darker palette entry -- declared,
+    // named, and mapped, and never painted -- sat there unused.
+    for (TILES) |t| {
+        var seen: [16]u32 = @splat(0);
+        for (0..VARIANTS) |v| {
+            for (0..NP) |k| {
+                seen[t.art[v][0][k]] += 1;
+            }
+        }
+        if (seen[t.map] == 0) {
+            std.debug.print("\n  {s} is mapped as {d} but never paints it\n", .{ t.name, t.map });
+            return error.MapColourNotInArt;
+        }
+    }
 }
