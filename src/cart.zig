@@ -1049,7 +1049,7 @@ fn draw() void {
         vex.cls(C.ui_bg);
         var done: usize = 0;
         for (0..CELLS) |i| done += @intFromBool(@popCount(masks[i]) == 1);
-        vex.text("COLLAPSING THE WORLD", 8, 8, C.ui_text);
+        vex.text(generatingText(), 8, 8, C.ui_text);
         vex.rect(8, 20, 120, 4, C.ui_dim);
         vex.rect(8, 20, 120 * @divTrunc(@as(i32, @intCast(done)), @as(i32, @intCast(CELLS))), 4, C.ui_fill);
         vex.text(say("SEED {X}", .{seed}), 8, 32, C.ui_dim);
@@ -1185,6 +1185,33 @@ fn drawMinimap() void {
 /// never rendered. Clipped text does not look clipped -- the line just ends.
 const HINT_SCROLL = "ARROWS/LMB SCROLL   X/RMB MAP   Z NEW";
 const HINT_MAP = "CLICK MOVE BOX   X/RMB WORLD";
+
+/// What the cart calls the work while a world is collapsing. Picked per world
+/// rather than per frame, so it settles instead of flickering, and hashed from
+/// the seed rather than drawn from `rnd()` so that choosing a phrase cannot
+/// shift the generator's random stream and change the world a seed produces.
+const GENERATING = [_][:0]const u8{
+    "COLLAPSING THE WORLD",
+    "RAISING THE CONTINENTS",
+    "RESOLVING THE COASTLINE",
+    "FLOODING THE BASINS",
+    "SURVEYING THE TERRAIN",
+    "COUNTING THE ISLANDS",
+    "PLOTTING THE SHORELINE",
+    "SETTLING THE TIDE",
+    "DRAWING THE COASTLINE",
+    "FOLDING THE FAULTS",
+    "CALLING THE MOUNTAINS",
+    "SALTING THE LOWLANDS",
+    "MEASURING THE FALL",
+    "TRACING THE RIDGES",
+    "SOUNDING THE DEEP",
+    "SEEDING THE WORLD",
+};
+
+fn generatingText() [:0]const u8 {
+    return GENERATING[hash(seed, 0x6E0F, 0x6E0F) % GENERATING.len];
+}
 
 /// 8x8 glyphs, per the console font.
 const CHAR_W: i32 = 8;
@@ -1951,6 +1978,45 @@ test "every HUD line fits the screen in the 8x8 font" {
     // And the font assumption itself, so a console font change fails here rather
     // than as a silently clipped line much later.
     try std.testing.expectEqual(@as(i32, 39), cap);
+}
+
+test "every generating phrase fits, and the list is worth having" {
+    // Same clipping trap as the HUD hints: the progress line is drawn at x=8,
+    // so it has one glyph less than the HUD, and a phrase that overruns simply
+    // stops. A world-generation caption that fades out mid-word reads as a
+    // rendering bug rather than as a caption.
+    const cap = (vex.WIDTH - 2 * 8) / CHAR_W;
+    for (GENERATING) |p| {
+        try std.testing.expect(@as(i32, @intCast(p.len)) <= cap);
+        try std.testing.expect(p.len > 0);
+    }
+    // A list of one would satisfy everything above and defeat the point.
+    try std.testing.expect(GENERATING.len > 4);
+
+    // The pick is a pure function of the seed, and does not come out of `rnd()`
+    // -- drawing from the generator's own stream would shift every subsequent
+    // value and change the world a given seed produces. Pinned here so that
+    // stays true.
+    const was = seed;
+    defer seed = was;
+    seed = 0x1234;
+    const first = generatingText();
+    for (0..64) |_| _ = rnd(); // however much the generator has drawn by now
+    try std.testing.expectEqualStrings(first, generatingText());
+    // and different seeds do land on different phrases, or the list is dead
+    // weight
+    var distinct: usize = 0;
+    var outer: usize = 0;
+    while (outer < 64) : (outer += 1) {
+        seed = @truncate(outer *% 2654435761);
+        var seen_here = false;
+        for (GENERATING, 0..) |p, i| {
+            if (std.mem.eql(u8, p, generatingText())) seen_here = true;
+            _ = i;
+        }
+        if (seen_here) distinct += 1;
+    }
+    try std.testing.expect(distinct > 4);
 }
 
 test "every elevation tier gets a visible share of the land" {
