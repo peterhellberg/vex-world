@@ -454,19 +454,66 @@ fn lerp(a: f32, b: f32, t: f32) f32 {
     return a + (b - a) * t;
 }
 
-/// How high cell `i` wants to be, 0..1. Two octaves of value noise: the coarse
-/// one decides where the continents are, the fine one breaks up the coastline.
+/// How high cell `i` wants to be, 0..1.
+///
+/// Four octaves, each halving in amplitude, because the straight beaches were
+/// not a missing detail problem -- they were an interpolation problem. Within
+/// one lattice cell the field is bilinear, so its contours are piecewise
+/// straight, and at 6x4 across 320x160 a single straight run reached ~50 tiles.
+/// More octaves put detail at every scale, so the eye stops reading the shape
+/// as a blob and the straight segments become shorter than the interesting
+/// bends around them.
+const OCTAVES = [_]struct { w: usize, h: usize, amp: f32 }{
+    .{ .w = 6, .h = 4, .amp = 0.53 },
+    .{ .w = 13, .h = 8, .amp = 0.27 },
+    .{ .w = 25, .h = 16, .amp = 0.13 },
+    .{ .w = 49, .h = 32, .amp = 0.07 },
+};
+
+/// Offsets of each octave inside `oct_pool`.
+const OCT_OFF = blk: {
+    var off: [OCTAVES.len]usize = undefined;
+    var at: usize = 0;
+    for (OCTAVES, 0..) |o, k| {
+        off[k] = at;
+        at += o.w * o.h;
+    }
+    break :blk off;
+};
+
+const OCT_POOL: usize = OCT_OFF[OCTAVES.len - 1] + OCTAVES[OCTAVES.len - 1].w * OCTAVES[OCTAVES.len - 1].h;
+var oct_pool: [OCT_POOL]f32 = undefined;
+
+/// How far the warp can pull a sample point, as a fraction of the map. This is
+/// the other half of the fix: octaves alone give detail but keep every
+/// contour's overall direction, so coastlines still trace the lattice. Warping
+/// bends them. Kept small on purpose -- a large warp folds the field over
+/// itself and puts inland lakes in the wrong place.
+const WARP_AMOUNT: f32 = 0.18;
+
 var height: [CELLS]f32 = @splat(0);
 var height_salt: u32 = 0;
 
 fn buildHeight(salt: u32) void {
-    // 6x4 and 13x8 lattices: continents and shoreline detail
-    var lat: [24 + 13 * 8]f32 = undefined;
-    for (0..6 * 4) |i| lat[i] = noiseVal(@intCast(i % 6), @intCast(i / 6), salt +% 11);
-    for (0..13 * 8) |i| lat[i + 24] = noiseVal(@intCast(i % 13), @intCast(i / 13), salt +% 907);
+    for (OCTAVES, 0..) |o, k| {
+        for (0..o.w * o.h) |i| {
+            oct_pool[OCT_OFF[k] + i] = noiseVal(@intCast(i % o.w), @intCast(i / o.w), salt +% @as(u32, @intCast(k)) *% 0x9E37);
+        }
+    }
     var peak: f32 = 0;
     for (0..MAP_H) |y| for (0..MAP_W) |x| {
-        const h = 0.72 * sample(lat[0..24], 6, 4, x, y) + 0.28 * sample(lat[24..], 13, 8, x, y);
+        const bx = @as(f32, @floatFromInt(x)) / @as(f32, @floatFromInt(MAP_W - 1));
+        const by = @as(f32, @floatFromInt(y)) / @as(f32, @floatFromInt(MAP_H - 1));
+        // Warp first, then sample the stack at the displaced point. The warp
+        // itself comes from the coarse octave sampled in two far-apart places,
+        // so x and y displace independently instead of sliding along one line.
+        const wx = (octSample(0, 0.0, bx * 3.0, by * 3.0) - 0.5) * WARP_AMOUNT;
+        const wy = (octSample(0, OCTAVES[0].w, bx * 3.0 + 7.7, by * 3.0 + 3.1) - 0.5) * WARP_AMOUNT;
+        var sum: f32 = 0;
+        for (OCTAVES, 0..) |o, k| {
+            sum += o.amp * octSample(k, 0.0, (bx + wx) * @as(f32, @floatFromInt(o.w)), (by + wy) * @as(f32, @floatFromInt(o.h)));
+        }
+        const h = sum;
         height[y * MAP_W + x] = h;
         peak = @max(peak, h);
     };
@@ -482,20 +529,35 @@ fn noiseVal(x: u32, y: u32, s: u32) f32 {
     return @as(f32, @floatFromInt(hash(x, y, s ^ height_salt) & 0xFFFF)) / 65535.0;
 }
 
-/// Bilinear value noise with a smoothstep fade, so the field has no lattice
-/// creases -- a straight lerp would band along every lattice line.
-fn sample(lat: []const f32, w: usize, h: usize, x: usize, y: usize) f32 {
-    const fx = @as(f32, @floatFromInt(x)) * @as(f32, @floatFromInt(w - 1)) / @as(f32, @floatFromInt(MAP_W - 1));
-    const fy = @as(f32, @floatFromInt(y)) * @as(f32, @floatFromInt(h - 1)) / @as(f32, @floatFromInt(MAP_H - 1));
-    const x0: usize = @intFromFloat(@min(@floor(fx), @as(f32, @floatFromInt(w - 1))));
-    const y0: usize = @intFromFloat(@min(@floor(fy), @as(f32, @floatFromInt(h - 1))));
-    const tx = fx - @floor(fx);
-    const ty = fy - @floor(fy);
+/// Value noise at fractional lattice coords, wrapping instead of clamping.
+///
+/// `skip` picks a different window of the same wrapping octave so two
+/// independent fields can be read out of one lattice. Wrapping is what makes
+/// the warp safe: a clamped sample goes flat where the warp pushes it off the
+/// lattice, and a flat field near the map edge is precisely the straight
+/// shoreline this is here to remove.
+fn octSample(k: usize, skip: f32, fx: f32, fy: f32) f32 {
+    const o = OCTAVES[k];
+    const fw: f32 = @floatFromInt(o.w);
+    const fh: f32 = @floatFromInt(o.h);
+    const gx = fx + skip;
+    const gy = fy + skip;
+    const ix = @floor(gx);
+    const iy = @floor(gy);
+    const x0: usize = @intFromFloat(@mod(ix, fw));
+    const y0: usize = @intFromFloat(@mod(iy, fh));
+    const x1 = (x0 + 1) % o.w;
+    const y1 = (y0 + 1) % o.h;
+    const tx = gx - ix;
+    const ty = gy - iy;
+    // smoothstep fade, so the field has no lattice creases -- a straight lerp
+    // would band along every lattice line
     const sx = tx * tx * (3 - 2 * tx);
     const sy = ty * ty * (3 - 2 * ty);
+    const base = OCT_OFF[k];
     return lerp(
-        lerp(lat[y0 * w + x0], lat[y0 * w + @min(x0 + 1, w - 1)], sx),
-        lerp(lat[@min(y0 + 1, h - 1) * w + x0], lat[@min(y0 + 1, h - 1) * w + @min(x0 + 1, w - 1)], sx),
+        lerp(oct_pool[base + y0 * o.w + x0], oct_pool[base + y0 * o.w + x1], sx),
+        lerp(oct_pool[base + y1 * o.w + x0], oct_pool[base + y1 * o.w + x1], sx),
         sy,
     );
 }
