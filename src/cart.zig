@@ -510,7 +510,7 @@ fn wantClass(h: f32) u8 {
 var masks: [CELLS]u16 = @splat(ALL_TILES); // tiles still allowed per cell
 var world: [CELLS]u8 = @splat(DEEP); // the chosen tile, valid once solved
 var queued: [CELLS]bool = @splat(false);
-var stack: [CELLS]usize = undefined;
+var stack: [CELLS]u16 = undefined;
 var solved: bool = false;
 var seed: u32 = 0xC0FFEE;
 var rng: u32 = 0xC0FFEE;
@@ -551,6 +551,100 @@ fn drawOverview() void {
     vex.text("ARROWS MOVE BOX   X BACK TO WORLD", 4, HUD_Y + 11, C.ui_dim);
 }
 
+// -- entropy buckets --------------------------------------------------------
+// WFC collapses the cell with the *fewest* options left, which is what keeps
+// contradictions rare. Finding that cell by rescanning the whole map made the
+// whole solve quadratic -- N collapses, each scanning N cells -- and that is
+// what capped the map size: 12k cells took ~430ms, and the trend put 51k cells
+// somewhere past 7 seconds.
+//
+// Entropy here is just a popcount of a u16 mask, so it is bounded to
+// TILE_COUNT values. Keeping the undecided cells in one list per entropy makes
+// "the fewest options" a walk down nine heads instead of a scan, and the solve
+// becomes linear in cells. Each cell sits in exactly one list, as an intrusive
+// doubly-linked node, so narrowing a cell moves it between lists in O(1) rather
+// than leaving a stale duplicate behind in a bucket that is never drained.
+//
+// Doubly linked because a cell is usually removed from the *middle* of a list
+// (it narrowed while sitting in a list of its old entropy) and a singly linked
+// list cannot unlink without the predecessor.
+
+const NO_CELL: u16 = 0xFFFF; // list terminator; also the "not in a list" marker
+const MAX_ENTROPY: usize = TILE_COUNT;
+
+var bucket_head: [MAX_ENTROPY + 1]u16 = @splat(NO_CELL);
+var bucket_next: [CELLS]u16 = @splat(NO_CELL);
+var bucket_prev: [CELLS]u16 = @splat(NO_CELL);
+/// Which entropy list a cell is on, or NO_CELL if it is decided/not queued.
+var bucket_of: [CELLS]u8 = @splat(@as(u8, 0xFF));
+
+/// Drop every cell from the lists. Needed at the start of a world: linking cells
+/// straight back in would splice them onto the *previous* world's list head and
+/// chain the two together, so walking a list would run off the end.
+fn bucketsClear() void {
+    for (&bucket_head) |*h| h.* = NO_CELL;
+    for (&bucket_of) |*b| b.* = 0xFF;
+    for (&bucket_next) |*n| n.* = NO_CELL;
+    for (&bucket_prev) |*p| p.* = NO_CELL;
+}
+
+fn bucketLink(i: usize, b: usize) void {
+    const u: u16 = @intCast(i);
+    const ub: u16 = @intCast(b);
+    bucket_prev[u] = NO_CELL;
+    bucket_next[u] = bucket_head[ub];
+    if (bucket_head[ub] != NO_CELL) bucket_prev[bucket_head[ub]] = u;
+    bucket_head[ub] = u;
+    bucket_of[u] = @intCast(b);
+}
+
+fn bucketUnlink(i: usize) void {
+    const u: u16 = @intCast(i);
+    const b = bucket_of[u];
+    if (b == 0xFF) return;
+    const p = bucket_prev[u];
+    const n = bucket_next[u];
+    if (p == NO_CELL) {
+        bucket_head[b] = n;
+    } else {
+        bucket_next[p] = n;
+    }
+    if (n != NO_CELL) bucket_prev[n] = p;
+    bucket_prev[u] = NO_CELL;
+    bucket_next[u] = NO_CELL;
+    bucket_of[u] = 0xFF;
+}
+
+/// Put `i` in the list matching its current options. Decided cells leave the
+/// lists entirely, which is what makes "every list empty" mean "map solved".
+fn bucketRequeue(i: usize) void {
+    const n: u8 = @intCast(@popCount(masks[i]));
+    if (n <= 1) {
+        bucketUnlink(i);
+        return;
+    }
+    if (bucket_of[i] == n) return; // already in the right place
+    bucketUnlink(i);
+    bucketLink(i, n);
+}
+
+/// The cell with the fewest options left, or null once every cell is decided.
+/// Ties come out of the list order, which is the order the cells were narrowed
+/// in -- that walks the constraint frontier outward, which is a decent
+/// substitute for picking uniformly among equals, and uniform would cost a scan
+/// all over again.
+fn pickCell() ?usize {
+    var b: usize = 2;
+    while (b <= MAX_ENTROPY) : (b += 1) {
+        while (bucket_head[b] != NO_CELL) {
+            const i: usize = bucket_head[b];
+            if (bucket_of[i] == b) return i;
+            bucketUnlink(i); // stale: the cell has narrowed since
+        }
+    }
+    return null;
+}
+
 fn rnd() u32 {
     rng ^= rng << 13;
     rng ^= rng >> 17;
@@ -563,12 +657,12 @@ fn rnd() u32 {
 /// Returns false on a contradiction, which means this seed is a dead end.
 fn propagate(start: usize) bool {
     var sp: usize = 0;
-    stack[sp] = start;
+    stack[sp] = @intCast(start);
     queued[start] = true;
     sp += 1;
     while (sp > 0) {
         sp -= 1;
-        const c = stack[sp];
+        const c: usize = stack[sp];
         queued[c] = false;
         const cx = c % MAP_W;
         const cy = c / MAP_W;
@@ -591,34 +685,16 @@ fn propagate(start: usize) bool {
                 masks[n] = next;
                 if (!queued[n]) {
                     queued[n] = true;
-                    stack[sp] = n;
+                    // the cell's options changed, so it belongs in a different
+                    // entropy list than the one it was on
+                    bucketRequeue(n);
+                    stack[sp] = @intCast(n);
                     sp += 1;
                 }
             }
         }
     }
     return true;
-}
-
-/// The cell with the fewest options left, ties broken by reservoir sampling so
-/// every candidate is equally likely. Null once the whole map is decided.
-fn pickCell() ?usize {
-    var best: usize = 0;
-    var best_n: u8 = TILE_COUNT + 1; // one past the widest possible mask
-    var seen: u32 = 0; // candidates with the current best_n
-    for (0..CELLS) |i| {
-        const n: u8 = @intCast(@popCount(masks[i]));
-        if (n <= 1) continue;
-        if (n < best_n) {
-            best_n = n;
-            best = i;
-            seen = 1;
-        } else if (n == best_n) {
-            seen += 1;
-            if (rnd() % seen == 0) best = i;
-        }
-    }
-    return if (best_n > TILE_COUNT) null else best;
 }
 
 /// A tile from `mask` for cell `i`, aimed at the elevation `height[i]` wants.
@@ -662,11 +738,15 @@ fn reset(s: u32) u32 {
     // 0.34..0.52: some worlds are mostly archipelago, some mostly continent
     sea = 0.34 + @as(f32, @floatFromInt(rnd() % 19)) * 0.01;
     for (&masks) |*m| m.* = ALL_TILES;
+    // Every cell starts wide open, so start them all in the widest list.
+    bucketsClear();
+    for (0..CELLS) |i| bucketLink(i, MAX_ENTROPY);
     // A ring of open sea frames the map, so the land reads as an island.
     var pinned: bool = false;
     for (0..MAP_H) |y| for (0..MAP_W) |x| {
         if (x != 0 and y != 0 and x != MAP_W - 1 and y != MAP_H - 1) continue;
         masks[y * MAP_W + x] = bit(DEEP);
+        bucketRequeue(y * MAP_W + x); // one option left: off the lists
         if (!propagate(y * MAP_W + x)) pinned = true;
     };
     solved = false;
@@ -685,6 +765,7 @@ fn solve(budget: usize) u32 {
             return seed;
         };
         masks[c] = @as(u16, 1) << @intCast(pickTile(c, masks[c]));
+        bucketRequeue(c); // decided: off the lists
         if (!propagate(c)) {
             // Dead end: a seed always dies the same way, so re-roll from it.
             retries += 1;
@@ -1138,4 +1219,39 @@ test "the palette table is the one the art is drawn against" {
         if (@TypeOf(v) != u8) continue;
         try std.testing.expect(v < 16);
     }
+}
+
+test "the entropy lists stay consistent with the cells they hold" {
+    _ = reset(0x99);
+    // Every undecided cell must be on exactly one list, and that list must be
+    // the one matching its popcount. Walking a list and checking the head
+    // against bucket_of catches a stale entry left behind by a narrowing that
+    // unlinked the wrong node.
+    for (0..CELLS) |i| {
+        const n: u8 = @intCast(@popCount(masks[i]));
+        if (n <= 1) {
+            try std.testing.expectEqual(@as(u8, 0xFF), bucket_of[i]);
+        } else {
+            try std.testing.expectEqual(n, bucket_of[i]);
+        }
+    }
+    // And the frontier has to be reachable: some cell must have the fewest
+    // options, or the solve is about to think the map is already decided.
+    var min_n: u8 = MAX_ENTROPY + 1;
+    for (0..CELLS) |i| {
+        const n: u8 = @intCast(@popCount(masks[i]));
+        if (n > 1) min_n = @min(min_n, n);
+    }
+    const c = pickCell() orelse return error.PickCellFoundNothing;
+    try std.testing.expectEqual(min_n, @as(u8, @intCast(@popCount(masks[c]))));
+
+    // Solve it and check the lists drained -- that is what tells pickCell the
+    // map is done.
+    var guard: usize = 0;
+    while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+    try std.testing.expect(solved);
+    for (0..CELLS) |i| {
+        try std.testing.expectEqual(@as(u8, 0xFF), bucket_of[i]);
+    }
+    try std.testing.expect(pickCell() == null);
 }
