@@ -124,9 +124,23 @@ const MAX_CAM_Y: i32 = @as(i32, @intCast(MAP_H * T)) - VIEW_H * @as(i32, @intCas
 /// Collapses per frame while generating, as a fraction of the map rather than a
 /// fixed number. A flat budget does not survive a resize: at 96 per frame the
 /// 51,200-cell map needed 533 frames -- nine seconds -- even though the whole
-/// solve costs tens of milliseconds. Dividing the map keeps the "watch it
-/// appear" pacing at roughly half a second whatever the size.
-const GENERATE_PER_FRAME: usize = @max(64, CELLS / 32);
+/// solve costs tens of milliseconds. Dividing the map keeps the pacing
+/// proportional to the map whatever its size.
+///
+/// The divisor is set so a generating frame costs about as much as it did
+/// before `propagate` stopped walking masks (see ALLOW). Measured in the real
+/// wasm3 runtime, not natively, because the interpreter is about 12x slower
+/// than the host and a native number would say nothing useful:
+///
+///   CELLS/32, before ALLOW:  269 ms to generate, 8.4 ms per generating frame
+///   CELLS/32, after  ALLOW:  139 ms to generate, 4.3 ms per generating frame
+///
+/// Halving the cost is worth spending on twice the work per frame, so this is
+/// CELLS/16: the same 8.6 ms per frame as was already being spent, and the map
+/// appears in half the frames. The vex SDK has no clock, so the budget cannot
+/// be expressed in milliseconds and self-limit; this ratio is the substitute,
+/// and it is why the number is a divisor of the map rather than a constant.
+const GENERATE_PER_FRAME: usize = @max(64, CELLS / 16);
 
 // -- tiles ------------------------------------------------------------------
 
@@ -236,6 +250,36 @@ const DY = [4]i32{ -1, 0, 1, 0 };
 const OPP = [4]usize{ 2, 3, 0, 1 };
 
 /// `ALLOWED[dir][tile]` = every tile that may touch it on that side.
+/// The union of what a direction allows, for every possible cell mask.
+///
+/// `propagate` worked this out per neighbour per pop, by walking the cell's
+/// remaining tiles: up to eleven iterations, four times over for every cell it
+/// popped. That walk is the hot loop of the whole generator -- it runs tens of
+/// millions of times on a 51,200-cell map -- and it recomputes the same answer
+/// over and over, because a mask is just an index and there are only
+/// `1 << TILE_COUNT` of them. One lookup instead of a popcount walk.
+///
+/// 16 KB of wasm for it, which is a fair trade against the ~90 KB the variant
+/// tables already cost, and it is the reason generation is table-driven rather
+/// than branch-driven.
+const ALLOW: [4][1 << TILE_COUNT]u16 = blk: {
+    @setEvalBranchQuota(8 * (1 << TILE_COUNT) * TILE_COUNT);
+    var out: [4][1 << TILE_COUNT]u16 = @splat(@splat(0));
+    for (0..4) |d| {
+        for (0..1 << TILE_COUNT) |mask| {
+            var m: u16 = @intCast(mask);
+            var acc: u16 = 0;
+            while (m != 0) {
+                const t: usize = @ctz(m);
+                m &= m - 1;
+                acc |= ALLOWED[OPP[d]][t];
+            }
+            out[d][mask] = acc;
+        }
+    }
+    break :blk out;
+};
+
 const ALLOWED: [4][TILE_COUNT]u16 = blk: {
     // This is a comptime triple loop over dirs x tiles x tiles, so the branch
     // budget has to cover it. Scaled off TILE_COUNT rather than pinned to a
@@ -914,8 +958,7 @@ fn bucketUnlink(i: usize) void {
 
 /// Put `i` in the list matching its current options. Decided cells leave the
 /// lists entirely, which is what makes "every list empty" mean "map solved".
-fn bucketRequeue(i: usize) void {
-    const n: u8 = @intCast(@popCount(masks[i]));
+fn bucketRequeue(i: usize, n: u8) void {
     if (n <= 1) {
         bucketUnlink(i);
         return;
@@ -963,26 +1006,22 @@ fn propagate(start: usize) bool {
         queued[c] = false;
         const cx = c % MAP_W;
         const cy = c / MAP_W;
+        // Fixed for the four directions below: a neighbour is never `c` itself,
+        // so nothing here can narrow the cell being propagated from.
+        const cm = masks[c];
         for (0..4) |d| {
             const nx = @as(i32, @intCast(cx)) + DX[d];
             const ny = @as(i32, @intCast(cy)) + DY[d];
             if (nx < 0 or ny < 0 or nx >= MAP_W or ny >= MAP_H) continue;
             const n: usize = @as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx));
 
-            var allow: u16 = 0;
-            var m = masks[c];
-            while (m != 0) {
-                const t: usize = @ctz(m);
-                m &= m - 1;
-                allow |= ALLOWED[OPP[d]][t];
-            }
-            const next = masks[n] & allow;
+            const next = masks[n] & ALLOW[d][cm];
             if (next == 0) return false;
             if (next != masks[n]) {
                 masks[n] = next;
                 // the cell's options changed, so it belongs in a different
                 // entropy list than the one it was on
-                bucketRequeue(n);
+                bucketRequeue(n, @intCast(@popCount(next)));
                 if (!queued[n]) {
                     queued[n] = true;
                     stack[sp] = @intCast(n);
@@ -1087,7 +1126,7 @@ fn solve(budget: usize) u32 {
             return seed;
         };
         masks[c] = @as(u16, 1) << @intCast(pickTile(c, masks[c]));
-        bucketRequeue(c); // decided: off the lists
+        bucketRequeue(c, 1); // decided: off the lists
         if (!propagate(c)) {
             // Dead end: a seed always dies the same way, so re-roll from it.
             retries += 1;
@@ -1555,6 +1594,28 @@ test "the same seed always collapses to the same world" {
         while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
         try std.testing.expect(solved);
         if (pass == 0) first = world else try std.testing.expectEqualSlices(u8, &first, &world);
+    }
+}
+
+test "the ALLOW lookup table agrees with walking the mask" {
+    // ALLOW replaces a per-neighbour popcount walk in `propagate` with a single
+    // table read, which is most of the generator's speed. The risk is that it
+    // is a *snapshot*: ALLOW is built at comptime from ALLOWED, so editing an
+    // adjacency rule and forgetting to rebuild the table would leave the
+    // generator propagating the old constraints with no complaint from
+    // anything. All 2^11 masks and all four directions, which is 8,192 cases
+    // and still instant.
+    for (0..4) |d| {
+        for (0..1 << TILE_COUNT) |mask| {
+            var m: u16 = @intCast(mask);
+            var want: u16 = 0;
+            while (m != 0) {
+                const t: usize = @ctz(m);
+                m &= m - 1;
+                want |= ALLOWED[OPP[d]][t];
+            }
+            try std.testing.expectEqual(want, ALLOW[d][mask]);
+        }
     }
 }
 
