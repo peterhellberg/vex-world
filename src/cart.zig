@@ -1131,14 +1131,52 @@ fn draw() void {
     // tile, and vanished outright on the plains, which are one flat tone. The
     // outer ring is a pixel beyond the tile, so it is drawn on the *neighbours*
     // and keeps a visible boundary whatever they happen to be.
-    if (my < HUD_Y and vex.mdown(vex.MOUSE_LEFT)) {
+    // Not over the minimap: the panel is drawn after this, so an outline here
+    // would be painted over anyway, and the HUD would name a tile the player is
+    // looking at the *map* of rather than standing on.
+    const over_panel = !zoomed_out and mx >= MINIMAP_X - 1 and mx < MINIMAP_X + MINIMAP_W + 1 and
+        my >= MINIMAP_Y - 1 and my < MINIMAP_Y + MINIMAP_H + 1;
+    if (my < HUD_Y and !over_panel and vex.mdown(vex.MOUSE_LEFT)) {
         vex.rectb(hx * t_i - cam_x - 1, hy * t_i - cam_y - 1, t_i + 2, t_i + 2, C.ui_bright);
         vex.rectb(hx * t_i - cam_x, hy * t_i - cam_y, t_i, t_i, TILES[hover].map);
     }
 
+    drawMinimap();
+
     vex.rect(0, HUD_Y, vex.WIDTH, vex.HEIGHT - HUD_Y, C.ui_bg);
     vex.text(say("SEED {X}  {d},{d}  {s}", .{ seed, hx, hy, TILES[hover].name }), 4, HUD_Y + 2, C.ui_text);
     vex.text(HINT_SCROLL, 4, HUD_Y + 11, C.ui_dim);
+}
+
+fn drawMinimap() void {
+    // A frame first, so the panel has an edge against whatever terrain is
+    // behind it. Without one it dissolves into a plain hillside.
+    vex.rectb(MINIMAP_X - 1, MINIMAP_Y - 1, MINIMAP_W + 2, MINIMAP_H + 2, C.ui_dim);
+    for (0..@as(usize, @intCast(MINIMAP_H))) |my| {
+        for (0..@as(usize, @intCast(MINIMAP_W))) |mx| {
+            const sx = @divTrunc(mx * MAP_W, @as(usize, @intCast(MINIMAP_W)));
+            const sy = @divTrunc(my * MAP_H, @as(usize, @intCast(MINIMAP_H)));
+            const px = MINIMAP_X + @as(i32, @intCast(mx));
+            const py = MINIMAP_Y + @as(i32, @intCast(my));
+            vex.pset(px, py, TILES[world[sy * MAP_W + sx]].map);
+        }
+    }
+    // Where the viewport is. Clamped on both ends: the camera can sit hard
+    // against a map edge, and a marker hanging off the panel would point
+    // nowhere.
+    const vw = @max(1, @divTrunc(VIEW_W * MINIMAP_W, @as(i32, @intCast(MAP_W))));
+    const vh = @max(1, @divTrunc(VIEW_H * MINIMAP_H, @as(i32, @intCast(MAP_H))));
+    const vx = std.math.clamp(
+        @divTrunc(@divTrunc(cam_x, @as(i32, @intCast(T))) * MINIMAP_W, @as(i32, @intCast(MAP_W))),
+        0,
+        MINIMAP_W - vw,
+    );
+    const vy = std.math.clamp(
+        @divTrunc(@divTrunc(cam_y, @as(i32, @intCast(T))) * MINIMAP_H, @as(i32, @intCast(MAP_H))),
+        0,
+        MINIMAP_H - vh,
+    );
+    vex.rectb(MINIMAP_X + vx, MINIMAP_Y + vy, vw, vh, C.ui_bright);
 }
 
 /// Both HUD hint lines, kept as consts so the fit check below sees them and the
@@ -1153,16 +1191,39 @@ const HINT_MAP = "CLICK MOVE BOX   X/RMB WORLD";
 const CHAR_W: i32 = 8;
 const HUD_MARGIN: i32 = 4;
 
-/// Map tile under a click in the 1:1 overview, or null if the click landed off
-/// the map -- on the frame, or on the HUD. Null matters: a click just past the
-/// edge would otherwise recentre on a tile far off the island, and the camera
-/// would jump somewhere the player never pointed at.
-fn overviewTileAt(mx: i32, my: i32) ?struct { x: i32, y: i32 } {
-    const x = mx - MAP_X;
-    const y = my - MAP_Y;
-    if (x < 0 or y < 0) return null;
-    if (x >= @as(i32, @intCast(MAP_W)) or y >= @as(i32, @intCast(MAP_H))) return null;
-    return .{ .x = x, .y = y };
+/// A map tile in map-cell coordinates, as a click resolves to one.
+const TileAt = struct { x: i32, y: i32 };
+
+/// Map tile under a click on a map drawn at `ox`,`oy` in `w`x`h` pixels, or
+/// null if the click landed off it. Null matters: a click just past the edge
+/// would otherwise recentre on a tile far off the island, and the camera would
+/// jump somewhere the player never pointed at.
+fn mapTileAt(mx: i32, my: i32, ox: i32, oy: i32, w: i32, h: i32) ?TileAt {
+    const x = mx - ox;
+    const y = my - oy;
+    if (x < 0 or y < 0 or x >= w or y >= h) return null;
+    // Stretched so the panel's first column is the map's first column and its
+    // last is the map's last, rather than by a fixed per-pixel bias.
+    //
+    // The scale here is 4x4, and every fixed bias strands one edge: mapping to
+    // the first covered cell puts the last panel pixel on 316, so the
+    // bottom-right corner of the map is unreachable by clicking; mapping to the
+    // last puts the first panel pixel on 3, stranding the left edge instead;
+    // taking the centre lands on 2 and 318 and strands both. Spreading the map
+    // across the panel reaches every cell, and at 1:1 -- w == MAP_W, which is
+    // what the full-screen overview uses -- it collapses to the identity, so the
+    // same expression is exact there and no second rule is needed.
+    return .{
+        .x = @divTrunc(x * (@as(i32, @intCast(MAP_W)) - 1), w - 1),
+        .y = @divTrunc(y * (@as(i32, @intCast(MAP_H)) - 1), h - 1),
+    };
+}
+
+/// The full-screen overview's placement. Split out because the click handler
+/// needs the same rectangle the drawing does, and duplicating the arithmetic
+/// is how the two drift apart.
+fn overviewTileAt(mx: i32, my: i32) ?TileAt {
+    return mapTileAt(mx, my, MAP_X, MAP_Y, @intCast(MAP_W), @intCast(MAP_H));
 }
 
 fn input() void {
@@ -1202,11 +1263,18 @@ fn input() void {
     // keys do, so the map is usable without hunting for a key that matches the
     // direction you want. The mouse API has no "just pressed", only held, so the
     // edge is detected above.
-    if (zoomed_out and clicked and mouseOnScreen()) {
-        if (overviewTileAt(vex.mx(), vex.my())) |t| {
+    if (clicked and mouseOnScreen()) {
+        // Whichever map is on screen. The small panel is drawn over the world
+        // view and looks exactly as clickable as the full one, so leaving it
+        // inert would be a dead spot in the middle of the screen.
+        const t = if (zoomed_out)
+            overviewTileAt(vex.mx(), vex.my())
+        else
+            mapTileAt(vex.mx(), vex.my(), MINIMAP_X, MINIMAP_Y, MINIMAP_W, MINIMAP_H);
+        if (t) |tile| {
             const ti: i32 = @intCast(T);
-            cam_x = (t.x - @divTrunc(VIEW_W, 2)) * ti;
-            cam_y = (t.y - @divTrunc(VIEW_H, 2)) * ti;
+            cam_x = (tile.x - @divTrunc(VIEW_W, 2)) * ti;
+            cam_y = (tile.y - @divTrunc(VIEW_H, 2)) * ti;
         }
     }
 
@@ -1245,6 +1313,19 @@ fn mouseOnScreen() bool {
 fn justPressed(held: bool, was_down: bool) bool {
     return held and !was_down;
 }
+
+/// A small map drawn over the world view, so you can see where you are without
+/// leaving the view you zoomed in to get. The full-screen overview answers
+/// "what does this world look like" but throws away the tile detail; this
+/// answers "where am I in it" for a quarter of the screen width.
+///
+/// Every minimap pixel is a 4x4 block of map cells, which is why it can be
+/// this small without aliasing into noise: at 1:1 it would be the whole map, and
+/// a 4x4 box average of a coastline is still a coastline.
+const MINIMAP_W: i32 = 80;
+const MINIMAP_H: i32 = 40;
+const MINIMAP_X: i32 = vex.WIDTH - MINIMAP_W - 4;
+const MINIMAP_Y: i32 = 4;
 
 /// Whether the mouse should move the camera this frame. Split out from input()
 /// so the rule is one named thing rather than a condition buried in a block of
@@ -1905,4 +1986,42 @@ test "every elevation tier gets a visible share of the land" {
         hi = @max(hi, s2);
     }
     try std.testing.expect(hi / lo < 12.0);
+}
+
+test "the small minimap resolves a click to the tile under it" {
+    // The panel is 4x4 down from the map, so a click resolves by scaling rather
+    // than by offsetting. The corners are what matter: each minimap pixel covers
+    // four map cells, and a naive round-down puts the far corner of the panel
+    // one row and one column short of the last tile.
+    const tl = mapTileAt(MINIMAP_X, MINIMAP_Y, MINIMAP_X, MINIMAP_Y, MINIMAP_W, MINIMAP_H).?;
+    try std.testing.expectEqual(@as(i32, 0), tl.x);
+    try std.testing.expectEqual(@as(i32, 0), tl.y);
+    const br = mapTileAt(
+        MINIMAP_X + MINIMAP_W - 1,
+        MINIMAP_Y + MINIMAP_H - 1,
+        MINIMAP_X,
+        MINIMAP_Y,
+        MINIMAP_W,
+        MINIMAP_H,
+    ).?;
+    try std.testing.expectEqual(@as(i32, @intCast(MAP_W)) - 1, br.x);
+    try std.testing.expectEqual(@as(i32, @intCast(MAP_H)) - 1, br.y);
+
+    // Off the panel, including the frame's own pixel.
+    try std.testing.expect(mapTileAt(MINIMAP_X - 1, MINIMAP_Y, MINIMAP_X, MINIMAP_Y, MINIMAP_W, MINIMAP_H) == null);
+    try std.testing.expect(mapTileAt(MINIMAP_X + MINIMAP_W, MINIMAP_Y, MINIMAP_X, MINIMAP_Y, MINIMAP_W, MINIMAP_H) == null);
+
+    // Every click must land inside the map, and the panel must sit on screen.
+    for (0..MINIMAP_H) |my| {
+        for (0..MINIMAP_W) |mx| {
+            const t = mapTileAt(MINIMAP_X + @as(i32, @intCast(mx)), MINIMAP_Y + @as(i32, @intCast(my)), MINIMAP_X, MINIMAP_Y, MINIMAP_W, MINIMAP_H) orelse
+                return error.MinimapPixelMissed;
+            if (t.x < 0 or t.y < 0 or t.x >= @as(i32, @intCast(MAP_W)) or t.y >= @as(i32, @intCast(MAP_H)))
+                return error.MinimapClickOutOfRange;
+        }
+    }
+    try std.testing.expect(MINIMAP_X >= 0 and MINIMAP_Y >= 0);
+    try std.testing.expect(MINIMAP_X + MINIMAP_W <= vex.WIDTH);
+    // and clear of the HUD, which it would otherwise be painted over
+    try std.testing.expect(MINIMAP_Y + MINIMAP_H < HUD_Y);
 }
