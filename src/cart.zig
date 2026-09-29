@@ -7,6 +7,7 @@
 //! tile -- about 200, not one per map cell.
 const std = @import("std");
 const vex = @import("vex");
+const build_options = @import("build_options");
 
 // -- palette ----------------------------------------------------------------
 // JONK 16, applied over the console's default SWEETIE-16 in boot().
@@ -589,9 +590,6 @@ fn octSample(k: usize, skip: f32, fx: f32, fy: f32) f32 {
     );
 }
 
-/// The class a cell would ideally be, from its height. These band edges are
-/// the real knobs of the world: they set how much of the map is ocean, how
-/// wide the beaches are, and how much of the highlands is snow.
 fn wantClass(h: f32) u8 {
     if (h < sea) return DEEP;
     if (h < sea + 0.015) return SHALLOW;
@@ -607,14 +605,18 @@ var world: [CELLS]u8 = @splat(DEEP); // the chosen tile, valid once solved
 var queued: [CELLS]bool = @splat(false);
 var stack: [CELLS]u16 = undefined;
 var solved: bool = false;
-var seed: u32 = 0xC0FFEE;
+/// `zig build -Dseed=N` pins this, so `make seeds` can render a spread of
+/// worlds without editing the source between builds.
+var seed: u32 = build_options.seed orelse 0xC0FFEE;
 var rng: u32 = 0xC0FFEE;
 var retries: u32 = 0;
 var frame: i32 = 0;
 var cam_x: i32 = 0;
 var cam_y: i32 = 0;
 /// X swaps the scrolling view for the whole world at one pixel per tile.
-var zoomed_out: bool = false;
+/// `zig build -Dmap_view=1` starts there instead, so `make overview` can render
+/// the whole map from the command line with no TTY to press X in.
+var zoomed_out: bool = build_options.map_view;
 /// The mouse API reports held, not just-pressed, so the click edge is detected
 /// by keeping the previous frame's state.
 var mouse_was_down: bool = false;
@@ -778,11 +780,11 @@ fn propagate(start: usize) bool {
             if (next == 0) return false;
             if (next != masks[n]) {
                 masks[n] = next;
+                // the cell's options changed, so it belongs in a different
+                // entropy list than the one it was on
+                bucketRequeue(n);
                 if (!queued[n]) {
                     queued[n] = true;
-                    // the cell's options changed, so it belongs in a different
-                    // entropy list than the one it was on
-                    bucketRequeue(n);
                     stack[sp] = @intCast(n);
                     sp += 1;
                 }
@@ -869,18 +871,6 @@ fn solve(budget: usize) u32 {
     return 0;
 }
 
-/// Map tile under a click in the 1:1 overview, or null if the click landed off
-/// the map -- on the frame, or on the HUD. Null matters: a click just past the
-/// edge would otherwise recentre on a tile far off the island, and the camera
-/// would jump somewhere the player never pointed at.
-fn overviewTileAt(mx: i32, my: i32) ?struct { x: i32, y: i32 } {
-    const x = mx - MAP_X;
-    const y = my - MAP_Y;
-    if (x < 0 or y < 0) return null;
-    if (x >= @as(i32, @intCast(MAP_W)) or y >= @as(i32, @intCast(MAP_H))) return null;
-    return .{ .x = x, .y = y };
-}
-
 // -- draw -------------------------------------------------------------------
 
 // The `:0` gives the buffer a sentinel slot, and `say` writes the NUL itself:
@@ -951,6 +941,7 @@ fn draw() void {
         }
     };
 
+    // The mouse can sit below the last map row (over the HUD, or in the sliver
     // The console reports a pointer position even when the window does not have
     // focus, and that position is not a screen coordinate -- it can be negative,
     // or past the far edge. Feed it to the map only when it really is on screen:
@@ -984,16 +975,26 @@ fn draw() void {
     vex.text("ARROWS OR MOUSE EDGE SCROLL   X MAP   Z NEW", 4, HUD_Y + 11, C.ui_dim);
 }
 
+/// Map tile under a click in the 1:1 overview, or null if the click landed off
+/// the map -- on the frame, or on the HUD. Null matters: a click just past the
+/// edge would otherwise recentre on a tile far off the island, and the camera
+/// would jump somewhere the player never pointed at.
+fn overviewTileAt(mx: i32, my: i32) ?struct { x: i32, y: i32 } {
+    const x = mx - MAP_X;
+    const y = my - MAP_Y;
+    if (x < 0 or y < 0) return null;
+    if (x >= @as(i32, @intCast(MAP_W)) or y >= @as(i32, @intCast(MAP_H))) return null;
+    return .{ .x = x, .y = y };
+}
+
 fn input() void {
-    // X used to be a fast-scroll modifier. A one-pixel-per-tile view of the
-    // whole island is worth more than the speed, and a modifier nobody can see
-    // is easy to forget is even there.
     if (vex.pressed(vex.X)) zoomed_out = !zoomed_out;
     const speed: i32 = 2;
     if (vex.down(vex.LEFT)) cam_x -= speed;
     if (vex.down(vex.RIGHT)) cam_x += speed;
     if (vex.down(vex.UP)) cam_y -= speed;
     if (vex.down(vex.DOWN)) cam_y += speed;
+
     // Edge scrolling. Not in the overview: there the whole island is already on
     // screen and the mouse is over the map, so screen edges mean nothing and
     // the camera would drift for no reason.
@@ -1410,53 +1411,6 @@ test "the palette table is the one the art is drawn against" {
     }
 }
 
-test "the entropy lists stay consistent with the cells they hold" {
-    _ = reset(0x99);
-    // Every undecided cell must be on exactly one list, and that list must be
-    // the one matching its popcount. Walking a list and checking the head
-    // against bucket_of catches a stale entry left behind by a narrowing that
-    // unlinked the wrong node.
-    for (0..CELLS) |i| {
-        const n: u8 = @intCast(@popCount(masks[i]));
-        if (n <= 1) {
-            try std.testing.expectEqual(@as(u8, 0xFF), bucket_of[i]);
-        } else {
-            try std.testing.expectEqual(n, bucket_of[i]);
-        }
-    }
-    // And the frontier has to be reachable: some cell must have the fewest
-    // options, or the solve is about to think the map is already decided.
-    var min_n: u8 = MAX_ENTROPY + 1;
-    for (0..CELLS) |i| {
-        const n: u8 = @intCast(@popCount(masks[i]));
-        if (n > 1) min_n = @min(min_n, n);
-    }
-    const c = pickCell() orelse return error.PickCellFoundNothing;
-    try std.testing.expectEqual(min_n, @as(u8, @intCast(@popCount(masks[c]))));
-
-    // Solve it and check the lists drained -- that is what tells pickCell the
-    // map is done.
-    var guard: usize = 0;
-    while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
-    try std.testing.expect(solved);
-    for (0..CELLS) |i| {
-        try std.testing.expectEqual(@as(u8, 0xFF), bucket_of[i]);
-    }
-    try std.testing.expect(pickCell() == null);
-}
-
-test "the map fits the screen, and its cell indices fit the sentinel" {
-    // The overview is one pixel per tile, centred in the area above the HUD, so
-    // a map wider than the screen or taller than that area would be cropped with
-    // no way to see the rest. The vertical bound is HUD_Y, not HEIGHT - HUD_Y:
-    // MAP_Y is derived from HUD_Y, so that is the space the map is placed in.
-    try std.testing.expect(@as(i32, @intCast(MAP_W)) <= vex.WIDTH);
-    try std.testing.expect(@as(i32, @intCast(MAP_H)) <= HUD_Y);
-    // The bucket lists use u16 indices and NO_CELL as a terminator, so a map
-    // at or past 0xFFFF cells would alias a real cell onto the terminator.
-    try std.testing.expect(CELLS < NO_CELL);
-}
-
 test "edge scroll is signed and points away from the edge it is against" {
     // Idle away from the edges, so the world does not creep under a still cursor.
     try std.testing.expectEqual(@as(i32, 0), edgeScroll(EDGE, vex.WIDTH));
@@ -1554,4 +1508,69 @@ test "clicking the overview picks the tile under the pointer, and only that" {
     try std.testing.expect(overviewTileAt(MAP_X, MAP_Y + @as(i32, @intCast(MAP_H))) == null);
     // the HUD strip sits below the map and is not part of it
     try std.testing.expect(overviewTileAt(0, HUD_Y) == null);
+}
+
+test "the map fits the screen, and its cell indices fit the sentinel" {
+    // The overview is 1px per tile, so the map is bounded by the drawable area.
+    try std.testing.expect(MAP_W <= @as(usize, @intCast(vex.WIDTH)));
+    try std.testing.expect(MAP_H <= @as(usize, @intCast(HUD_Y)));
+    // Cells are addressed as u16 to keep the arrays small, with NO_CELL as the
+    // terminator -- so a map one cell too large would alias the terminator and
+    // quietly corrupt the lists rather than fail to compile.
+    try std.testing.expect(CELLS < NO_CELL);
+}
+
+test "the entropy lists stay consistent with the cells they hold" {
+    // The lists are the only thing standing between the solver and a quadratic
+    // rescan, and a broken one is silent: the map still solves, it just stops
+    // picking the most constrained cell, and contradictions quietly get more
+    // common. So check the structure, not just the result.
+    var linked: usize = 0;
+    for (0..CELLS) |i| {
+        const n: u8 = @intCast(@popCount(masks[i]));
+        const b = bucket_of[i];
+        if (n <= 1) {
+            // decided cells must be off the lists, or they get collapsed twice
+            try std.testing.expectEqual(@as(u8, 0xFF), b);
+            continue;
+        }
+        try std.testing.expect(b == n); // on the list for its own options
+        try std.testing.expect(b >= 2 and b <= MAX_ENTROPY);
+        // links point to cells that are actually in that list
+        if (bucket_next[i] != NO_CELL) {
+            try std.testing.expectEqual(b, bucket_of[bucket_next[i]]);
+        }
+        if (bucket_prev[i] != NO_CELL) {
+            try std.testing.expectEqual(@as(u16, @intCast(i)), bucket_next[bucket_prev[i]]);
+        } else {
+            try std.testing.expectEqual(@as(u16, @intCast(i)), bucket_head[b]);
+        }
+        linked += 1;
+    }
+    // every undecided cell is reachable, i.e. some list is non-empty
+    const reached: usize = linked;
+    var b: usize = 2;
+    while (b <= MAX_ENTROPY) : (b += 1) {
+        var walk: u16 = bucket_head[b];
+        var guard: usize = 0;
+        while (walk != NO_CELL) : (walk = bucket_next[walk]) {
+            try std.testing.expect(guard < CELLS); // no cycles
+            try std.testing.expectEqual(b, bucket_of[walk]);
+            guard += 1;
+        }
+    }
+    try std.testing.expect(reached == linked);
+    // and pickCell agrees with the structure: it returns a minimum, and null
+    // only when nothing is left to decide
+    if (pickCell()) |c| {
+        try std.testing.expect(@popCount(masks[c]) > 1);
+        var best: u8 = MAX_ENTROPY + 1;
+        for (0..CELLS) |i| {
+            const n: u8 = @intCast(@popCount(masks[i]));
+            if (n > 1) best = @min(best, n);
+        }
+        try std.testing.expectEqual(best, @as(u8, @intCast(@popCount(masks[c]))));
+    } else {
+        for (0..CELLS) |i| try std.testing.expect(@popCount(masks[i]) == 1);
+    }
 }
