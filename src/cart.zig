@@ -617,9 +617,10 @@ var cam_y: i32 = 0;
 /// `zig build -Dmap_view=1` starts there instead, so `make overview` can render
 /// the whole map from the command line with no TTY to press X in.
 var zoomed_out: bool = build_options.map_view;
-/// The mouse API reports held, not just-pressed, so the click edge is detected
-/// by keeping the previous frame's state.
+/// The mouse API reports held, not just-pressed, so every mouse button needs its
+/// own previous-frame state to find the edge on.
 var mouse_was_down: bool = false;
+var mouse_right_was_down: bool = false;
 
 /// Top-left of the 1:1 overview, centred in the area above the HUD.
 const MAP_X: i32 = (vex.WIDTH - @as(i32, @intCast(MAP_W))) / 2;
@@ -972,7 +973,7 @@ fn draw() void {
 
     vex.rect(0, HUD_Y, vex.WIDTH, vex.HEIGHT - HUD_Y, C.ui_bg);
     vex.text(say("SEED {X}  {d},{d}  {s}", .{ seed, hx, hy, TILES[hover].name }), 4, HUD_Y + 2, C.ui_text);
-    vex.text("ARROWS SCROLL   HOLD MOUSE AT EDGE   X MAP   Z NEW", 4, HUD_Y + 11, C.ui_dim);
+    vex.text("ARROWS SCROLL   HOLD LMB AT EDGE   X OR RMB MAP   Z NEW", 4, HUD_Y + 11, C.ui_dim);
 }
 
 /// Map tile under a click in the 1:1 overview, or null if the click landed off
@@ -998,8 +999,17 @@ fn input() void {
     // Read the button once: edge scrolling and the overview click both want it,
     // and two reads of a "held" state is two chances to disagree.
     const held = vex.mdown(vex.MOUSE_LEFT);
-    const clicked = held and !mouse_was_down;
+    const clicked = justPressed(held, mouse_was_down);
     mouse_was_down = held;
+
+    // Right button toggles the overview as well, for anyone who never finds X.
+    //
+    // Rising edge, and that is not optional: the mouse API has no "just
+    // pressed", only held, so testing the button itself would flip the view
+    // every frame it is down and land wherever an odd number of frames left it.
+    const right = vex.mdown(vex.MOUSE_RIGHT);
+    if (justPressed(right, mouse_right_was_down)) zoomed_out = !zoomed_out;
+    mouse_right_was_down = right;
 
     // Edge scrolling, while the button is held -- see edgeScrollAllowed for why
     // each of the three conditions is there. Measured over the whole screen, HUD
@@ -1047,6 +1057,16 @@ const EDGE_SPEED: i32 = 4;
 fn mouseOnScreen() bool {
     return vex.mx() >= 0 and vex.mx() < vex.WIDTH and
         vex.my() >= 0 and vex.my() < vex.HEIGHT;
+}
+
+/// The frame a held button goes down, given its state now and last frame.
+///
+/// The keyboard has `pressed()` for this but the mouse does not -- `mbtn` is
+/// held only, so a one-shot mouse action has to find the edge itself. Without
+/// this, a toggle bound to the button fires every frame it is down and the view
+/// flips as fast as the frame rate.
+fn justPressed(held: bool, was_down: bool) bool {
+    return held and !was_down;
 }
 
 /// Whether the mouse should move the camera this frame. Split out from input()
@@ -1605,4 +1625,27 @@ test "the mouse only moves the camera while the button is held" {
     try std.testing.expect(edgeScrollAllowed(false, true, true));
     try std.testing.expect(!edgeScrollAllowed(true, true, true)); // nothing to scroll to
     try std.testing.expect(!edgeScrollAllowed(false, true, false)); // off-screen pointer
+}
+
+test "a held mouse button reads as one press, not one per frame" {
+    // There is no mbtnp(): mbtn() is held only. Anything bound to it has to
+    // find the rising edge itself, or a toggle flips every frame the button is
+    // down and lands on whichever side an odd number of frames left it.
+    //
+    // The whole truth table, because the failure is in the two cases that
+    // look harmless: staying down must not re-fire, and releasing must not
+    // fire either.
+    try std.testing.expect(justPressed(true, false)); // down this frame: the press
+    try std.testing.expect(!justPressed(true, true)); // still down: no
+    try std.testing.expect(!justPressed(false, true)); // released: no
+    try std.testing.expect(!justPressed(false, false)); // untouched: no
+
+    // A press-and-hold is exactly one press, whatever the frame rate.
+    var was_down = false;
+    var presses: usize = 0;
+    for (0..60) |_| {
+        if (justPressed(true, was_down)) presses += 1;
+        was_down = true;
+    }
+    try std.testing.expectEqual(@as(usize, 1), presses);
 }
