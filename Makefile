@@ -12,9 +12,8 @@ SHOT   ?= /tmp/vex-world.raw
 RAWSIZE ?= 320x180
 ZOOM    ?= 200
 
-# SEED pins the world. MAP_VIEW=false starts in the scrolling view instead of
-# the overview the cart opens in; unset takes the cart's own default, which is
-# already the overview.
+# SEED pins the world. MAP_VIEW=true starts in the whole-map overview instead
+# of the scrolling view the cart opens in.
 SEED    ?=
 SEEDS  ?= 0x51ED 0x7A3F 0x2C91 0xFEED 0x1234 0xABCD
 
@@ -103,13 +102,13 @@ png: shot
 
 ## overview: one PNG of the whole map, e.g. `make overview SEED=0x51ED`
 overview:
-	@$(MAKE) --no-print-directory png FRAMES=60 SEED=$(SEED)
+	@$(MAKE) --no-print-directory png FRAMES=60 SEED=$(SEED) MAP_VIEW=true
 
 ## seeds: one overview PNG per seed in SEEDS, for checking generator variety
 seeds:
 	@for s in $(SEEDS); do \
 		echo "== seed $$s"; \
-		$(MAKE) --no-print-directory png FRAMES=60 SEED=$$s \
+		$(MAKE) --no-print-directory png FRAMES=60 SEED=$$s MAP_VIEW=true \
 			SHOT=/tmp/vex-world-$$s.raw; \
 	done
 

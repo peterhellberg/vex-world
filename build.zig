@@ -7,9 +7,10 @@ pub fn build(b: *std.Build) void {
     // a spread of them without editing src/cart.zig between builds. Unset
     // means the cart's own default.
     const seed = b.option(u32, "seed", "Seed for the world to boot into");
-    // -Dmap_view=false boots into the scrolling view instead of the overview
-    // the cart opens in. Only useful for rendering that view headlessly.
-    const map_view = b.option(bool, "map_view", "Boot into the scrolling view");
+    // -Dmap_view=true boots into the whole-map overview instead of the
+    // scrolling view the cart opens in, for make overview / make seeds, which
+    // render headlessly and cannot press X.
+    const map_view = b.option(bool, "map_view", "Boot into the whole-map overview");
 
     // Carts compile to wasm32-freestanding.
     const wasm_target = b.resolveTargetQuery(.{

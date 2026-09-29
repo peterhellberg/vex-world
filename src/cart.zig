@@ -762,18 +762,19 @@ var retries: u32 = 0;
 var frame: i32 = 0;
 var cam_x: i32 = 0;
 var cam_y: i32 = 0;
-/// The whole map at one pixel per tile, which is where the cart opens.
+/// X (or the right mouse button) swaps the scrolling world view for the whole
+/// map at one pixel per tile. The cart opens zoomed *in*.
 ///
-/// Starting zoomed *in* dropped the player into one arbitrary corner of a
-/// 320x160 world with no idea of what the rest looked like, and the only way
-/// out was to press a key to find the map. Opening on the map inverts it: the
-/// shape of the world is the first thing on screen, and zooming in is a
-/// decision about where to go -- click the tile, or arrows and RMB/X to come
-/// back out.
+/// That was the other way round for a while, and the reason it changed is the
+/// minimap: opening on the map was the fix for starting in an arbitrary corner
+/// of a 320x160 world with no idea of the rest, and the panel now answers the
+/// same question -- where am I -- without throwing away the tile detail. So the
+/// first thing on screen is again the world itself, and the map is one keypress
+/// or a right-click away for when you want the whole shape of it.
 ///
-/// `zig build -Dmap_view=false` starts in the scrolling view instead, which is
-/// only useful for rendering that view headlessly.
-var zoomed_out: bool = cfg.map_view orelse true;
+/// `zig build -Dmap_view=true` opens on the overview instead, which is what
+/// `make overview` and `make seeds` need since they render headlessly.
+var zoomed_out: bool = cfg.map_view orelse false;
 /// The mouse API reports held, not just-pressed, so every mouse button needs its
 /// own previous-frame state to find the edge on.
 var mouse_was_down: bool = false;
@@ -1998,16 +1999,13 @@ test "every elevation tier gets a visible share of the land" {
     try std.testing.expect(hi / lo < 12.0);
 }
 test "the small minimap sits on screen and clear of the HUD" {
-    // The panel is a readout, not a control: clicking it does nothing, so the
-    // only things that can go wrong are the constants. It has to be fully on
-    // screen, and clear of the HUD, which is drawn after it and would paint
-    // over the bottom of the panel.
+    // The panel has to be fully on screen and clear of the HUD, which is drawn
+    // after it and would paint over the bottom. The frame is a pixel outside
+    // the panel on every side, so it needs a pixel of slack too.
     try std.testing.expect(MINIMAP_X >= 0);
     try std.testing.expect(MINIMAP_Y >= 0);
     try std.testing.expect(MINIMAP_X + MINIMAP_W <= vex.WIDTH);
     try std.testing.expect(MINIMAP_Y + MINIMAP_H < HUD_Y);
-    // The frame is drawn a pixel outside the panel on every side, so the panel
-    // needs a pixel of slack too or the frame clips.
     try std.testing.expect(MINIMAP_X > 0);
     try std.testing.expect(MINIMAP_Y > 0);
     // It should not cover the world outright either: 3200px against 51200 is
