@@ -323,9 +323,27 @@ const BAYER4 = [16]u8{ 0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5 };
 /// and one wobble pattern repeated with period 16 across the world. Anywhere
 /// three terrains interleave -- beach, shallows, deep sea -- the seams are
 /// frequent enough that the shared wobble read as a 16px grid.
+/// What a tile lends its *neighbour* at a seam. For every terrain this is just
+/// its art, because a terrain's art is its own ground all the way to the edge.
+/// Ruins are the exception: the art is a building standing on grass, and the
+/// building reaches 3px in from the tile's left edge while a band is 8px deep,
+/// so banding from the ruin's art pushes roof and wall out onto the grass next
+/// door. A ruin's *ground* is what crosses the seam, so that is what it lends.
+fn bandSource(other: u8, variant: usize) [NP]u8 {
+    if (other != RUINS) return TILES[other].art[variant][0];
+    var px: [NP]u8 = @splat(0);
+    for (0..T) |yy| for (0..T) |xx| {
+        const n = hash(@intCast(xx), @intCast(yy), @as(u32, @intFromEnum(Kind.ruins)) * 977 +%
+            @as(u32, @intCast(variant)) * 331 +% 1);
+        px[yy * T + xx] = if (n % 19 == 0) C.grass_light else C.grass;
+    };
+    return px;
+}
+
 fn bandArt(other: u8, dir: usize, variant: usize) [NP]u8 {
     @setEvalBranchQuota(200_000);
     const salt: u32 = 0xB0 +% @as(u32, other) * 31 +% @as(u32, @intCast(variant)) * 7;
+    const src = bandSource(other, variant);
     var px: [NP]u8 = @splat(0);
     for (0..T) |yy| for (0..T) |xx| {
         // how far in from the facing edge this pixel is
@@ -346,7 +364,7 @@ fn bandArt(other: u8, dir: usize, variant: usize) [NP]u8 {
         if (t >= BAND) continue; // wobble pushed it out of the band
         // 0 = all neighbour (on the edge), BAND = all this tile (back inside)
         if (BAYER4[(yy % 4) * 4 + (xx % 4)] * BAND >= t * 16) {
-            px[yy * T + xx] = TILES[other].art[variant][0][yy * T + xx];
+            px[yy * T + xx] = src[yy * T + xx];
         }
     };
     return px;
@@ -365,13 +383,6 @@ fn bandArt(other: u8, dir: usize, variant: usize) [NP]u8 {
 /// sole owner of each seam, so the blend is a single ramp with no second
 /// counter-ramp fighting it.
 const BAND_DIRS = [2]usize{ 1, 2 }; // east, south
-
-/// Ruins are excluded because they are a building standing *on* the plains, not
-/// a terrain of their own: blending them would dither grass through the walls
-/// and scatter roof onto the grass next door.
-fn bandsWith(t: u8) bool {
-    return t != RUINS;
-}
 
 fn dirSlot(d: usize) usize {
     const i: usize = if (d == BAND_DIRS[0]) 0 else 1;
@@ -1126,21 +1137,20 @@ fn draw() void {
         // the tile earlier in row-major order owns each seam and the blend is
         // one ramp instead of two overlapping.
         //
-        // Asymmetric in ruins, deliberately. As a band *source* ruins stays
-        // excluded, because its art is walls and roof: blending it outward
-        // scatters roof pixels across the grass next door. As a band *target* it
-        // has to be allowed, because otherwise a ruin owns its own seams and
-        // declines to draw them, leaving a hard cut where every other terrain
-        // boundary is dithered -- a ruin on a beach read as a rectangle pasted
-        // onto the map, with a crisp vertical line down one side. Receiving a
-        // band is safe in the one direction that matters: the neighbour's
-        // terrain feathers into the ruin's edge, and no roof leaves the tile.
+        // Ruins used to be excluded here, as a band source, because their art
+        // is a building and banding it outward scattered roof onto the grass
+        // next door. But the seam is owned by whichever tile comes first in
+        // row-major order, and the ruin's west and north neighbours always come
+        // first -- so excluding ruins left exactly those two sides of every
+        // ruin unblended, a crisp corner where the rest of the map dithers.
+        // `bandSource` is what makes it safe: a ruin lends its ground, never
+        // its building, so the seam feathers and no roof leaves the tile.
         for (BAND_DIRS) |d| {
             const nx = tx + DX[d];
             const ny = ty + DY[d];
             if (nx < 0 or ny < 0 or nx >= MAP_W or ny >= MAP_H) continue;
             const nb = world[@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx))];
-            if (nb == t or !bandsWith(nb)) continue;
+            if (nb == t) continue;
             // the band's blend texture has to be the variant the neighbour
             // actually draws, or every seam mismatches and the squares show
             const nv: usize = @intCast(hash(@bitCast(nx), @bitCast(ny), 0x5A5A) % VARIANTS);
@@ -1684,15 +1694,22 @@ test "a seam is blended once, and only on the half facing the neighbour" {
     // terrain boundary dithered -- a building pasted on the map. So the check
     // is on the one direction that is actually unsafe, and the neighbour test
     // in the draw loop is what stops roof leaving a ruin.
-    try std.testing.expect(!bandsWith(RUINS));
-    // Every *other* kind must be a usable band source, or the exclusion above
-    // is not the only one and seams go unblended the same way.
-    for (0..TILE_COUNT) |b| {
-        if (b == RUINS) continue;
-        try std.testing.expect(bandsWith(@intCast(b)));
+    // Ruins are now a band source, because a ruin's west and north seams are
+    // owned by the *neighbour* and the neighbour used to decline to draw them
+    // -- leaving a hard cut on exactly two sides of every ruin, which read as a
+    // crisp corner where the building's tile should have met the terrain.
+    // What it lends is its ground, never its building, and that is the property
+    // worth pinning down: a band is 8px deep and the cottage starts 3px in from
+    // the edge, so banding from the ruin's *art* would have carried roof and
+    // wall out onto the grass next door.
+    for (0..VARIANTS) |v| {
+        for (BAND_DIRS) |d| {
+            for (BANDS[RUINS][dirSlot(d)][v]) |px| {
+                try std.testing.expect(px == 0 or px == C.grass or px == C.grass_light);
+            }
+        }
     }
     for (0..TILE_COUNT) |b| {
-        if (!bandsWith(@intCast(b))) continue;
         for (BAND_DIRS) |d| {
             for (BANDS[b][dirSlot(d)][0]) |px| {
                 // 0 is the transparency key; anything else must be real art
@@ -1729,7 +1746,6 @@ test "no seam is blended from both sides" {
     // the shared edge, least of it back inside this tile. A reversed ramp
     // reproduces the same visible artifact from the other direction.
     for (0..TILE_COUNT) |b| {
-        if (!bandsWith(@intCast(b))) continue;
         for (BAND_DIRS) |d| {
             var at_edge: usize = 0;
             var at_back: usize = 0;
