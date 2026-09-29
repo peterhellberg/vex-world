@@ -954,18 +954,25 @@ fn draw() void {
         // the tile earlier in row-major order owns each seam and the blend is
         // one ramp instead of two overlapping.
         //
-        if (bandsWith(t)) {
-            for (BAND_DIRS) |d| {
-                const nx = tx + DX[d];
-                const ny = ty + DY[d];
-                if (nx < 0 or ny < 0 or nx >= MAP_W or ny >= MAP_H) continue;
-                const nb = world[@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx))];
-                if (nb == t or !bandsWith(nb)) continue;
-                // the band's blend texture has to be the variant the neighbour
-                // actually draws, or every seam mismatches and the squares show
-                const nv: usize = @intCast(hash(@bitCast(nx), @bitCast(ny), 0x5A5A) % VARIANTS);
-                vex.blit(&BANDS[nb][dirSlot(d)][nv], sx, sy, t_i, t_i, 0); // 0 = transparent
-            }
+        // Asymmetric in ruins, deliberately. As a band *source* ruins stays
+        // excluded, because its art is walls and roof: blending it outward
+        // scatters roof pixels across the grass next door. As a band *target* it
+        // has to be allowed, because otherwise a ruin owns its own seams and
+        // declines to draw them, leaving a hard cut where every other terrain
+        // boundary is dithered -- a ruin on a beach read as a rectangle pasted
+        // onto the map, with a crisp vertical line down one side. Receiving a
+        // band is safe in the one direction that matters: the neighbour's
+        // terrain feathers into the ruin's edge, and no roof leaves the tile.
+        for (BAND_DIRS) |d| {
+            const nx = tx + DX[d];
+            const ny = ty + DY[d];
+            if (nx < 0 or ny < 0 or nx >= MAP_W or ny >= MAP_H) continue;
+            const nb = world[@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx))];
+            if (nb == t or !bandsWith(nb)) continue;
+            // the band's blend texture has to be the variant the neighbour
+            // actually draws, or every seam mismatches and the squares show
+            const nv: usize = @intCast(hash(@bitCast(nx), @bitCast(ny), 0x5A5A) % VARIANTS);
+            vex.blit(&BANDS[nb][dirSlot(d)][nv], sx, sy, t_i, t_i, 0); // 0 = transparent
         }
     };
 
@@ -1369,7 +1376,21 @@ test "a seam is blended once, and only on the half facing the neighbour" {
     // 2. Every banding kind resolves to a real band, and those bands only ever
     //    contain art colours or the transparent 0 -- if 0 leaked in as art the
     //    blit key would punch holes in the terrain.
+    // Ruins are excluded as a band *source* only. It is tempting to read that
+    // as "ruins never blend", and the draw loop used to: it gated on
+    // `bandsWith(t)` as well, so a ruin also refused to *receive* a band, owned
+    // its seams by being earlier in row-major order, and declined to draw them.
+    // The result was a hard cut on every ruin boundary while every other
+    // terrain boundary dithered -- a building pasted on the map. So the check
+    // is on the one direction that is actually unsafe, and the neighbour test
+    // in the draw loop is what stops roof leaving a ruin.
     try std.testing.expect(!bandsWith(RUINS));
+    // Every *other* kind must be a usable band source, or the exclusion above
+    // is not the only one and seams go unblended the same way.
+    for (0..TILE_COUNT) |b| {
+        if (b == RUINS) continue;
+        try std.testing.expect(bandsWith(@intCast(b)));
+    }
     for (0..TILE_COUNT) |b| {
         if (!bandsWith(@intCast(b))) continue;
         for (BAND_DIRS) |d| {
