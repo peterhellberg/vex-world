@@ -504,6 +504,7 @@ fn buildHeight(salt: u32) void {
     for (0..MAP_H) |y| for (0..MAP_W) |x| {
         const bx = @as(f32, @floatFromInt(x)) / @as(f32, @floatFromInt(MAP_W - 1));
         const by = @as(f32, @floatFromInt(y)) / @as(f32, @floatFromInt(MAP_H - 1));
+        const fall = edgeFall(bx, by);
         // Warp first, then sample the stack at the displaced point. The warp
         // itself comes from the coarse octave sampled in two far-apart places,
         // so x and y displace independently instead of sliding along one line.
@@ -513,7 +514,12 @@ fn buildHeight(salt: u32) void {
         for (OCTAVES, 0..) |o, k| {
             sum += o.amp * octSample(k, 0.0, (bx + wx) * @as(f32, @floatFromInt(o.w)), (by + wy) * @as(f32, @floatFromInt(o.h)));
         }
-        const h = sum;
+        // Sink the field toward the edges so the map still reads as an island
+        // without pinning any tile. The old hard sea ring forced the class back
+        // one step per tile from the border, and that constant gradient is what
+        // drew straight beaches. Folding the falloff into the *height* instead
+        // means the coast sits on a noise iso-contour, so it wiggles.
+        const h = sum - fall;
         height[y * MAP_W + x] = h;
         peak = @max(peak, h);
     };
@@ -524,6 +530,27 @@ fn buildHeight(salt: u32) void {
         for (&height) |*h| h.* /= peak;
     }
 }
+
+/// How much to sink the field near the edges, 0 in the middle and past 1 in the
+/// corners. Radial rather than a distance-to-nearest-edge ramp: that would sink
+/// the map to a rounded rectangle, and the coast would trace the rounded
+/// rectangle. A radial falloff puts the shore on a noise iso-contour instead.
+fn edgeFall(bx: f32, by: f32) f32 {
+    const nx = (bx - 0.5) * 2.0;
+    const ny = (by - 0.5) * 2.0;
+    // 0 at the centre, ~1 at the middle of an edge, ~1.25 in the corners
+    const r = @sqrt(nx * nx + ny * ny);
+    // Push the radius around with the coarse octave, otherwise the falloff is a
+    // clean ellipse and the shore traces that ellipse -- the same problem as
+    // the sea ring, one shape up. Perturbing the radius puts the coast back on
+    // a noise iso-contour, so it bays and points instead of arcing.
+    const wobble = (octSample(0, 19.0, bx * 2.0 + 4.3, by * 2.0 + 8.1) - 0.5) * 0.75;
+    const t = @min(@max((r + wobble - SHORE_START) / (1.0 - SHORE_START), 0.0), 1.0);
+    return t * t * (3 - 2 * t) * 0.95;
+}
+
+/// Where the shore starts, as a fraction of the half-diagonal.
+const SHORE_START: f32 = 0.80;
 
 fn noiseVal(x: u32, y: u32, s: u32) f32 {
     return @as(f32, @floatFromInt(hash(x, y, s ^ height_salt) & 0xFFFF)) / 65535.0;
@@ -806,16 +833,15 @@ fn reset(s: u32) u32 {
     // Every cell starts wide open, so start them all in the widest list.
     bucketsClear();
     for (0..CELLS) |i| bucketLink(i, MAX_ENTROPY);
-    // A ring of open sea frames the map, so the land reads as an island.
-    var pinned: bool = false;
-    for (0..MAP_H) |y| for (0..MAP_W) |x| {
-        if (x != 0 and y != 0 and x != MAP_W - 1 and y != MAP_H - 1) continue;
-        masks[y * MAP_W + x] = bit(DEEP);
-        bucketRequeue(y * MAP_W + x); // one option left: off the lists
-        if (!propagate(y * MAP_W + x)) pinned = true;
-    };
+    // No sea ring. One used to frame the map as an island, but pinning the
+    // border to open sea fights the field: the terrain wants land right up to
+    // the edge, and |cls delta| <= 1 only lets the class climb one step per
+    // tile, so the ring dragged a 4-tile water gradient all the way round the
+    // map. That gradient is what drew a dead-straight beach parallel to every
+    // edge. The map edge is a viewport edge, not a coastline, so terrain is
+    // free to run off it.
     solved = false;
-    return if (pinned) s else 0;
+    return 0;
 }
 
 /// Collapse up to `budget` cells, or until the map is decided / a dead end
@@ -972,20 +998,14 @@ export fn update() void {
 
 test "a solved world obeys every adjacency rule" {
     for (0..4) |trial| {
-        // the sea ring must always pin; a non-zero return would mean the tile
-        // rules have become unsatisfiable rather than this seed being unlucky
         try std.testing.expectEqual(@as(u32, 0), reset(0xC0FFEE +% @as(u32, @intCast(trial))));
         var guard: usize = 0;
         while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
         try std.testing.expect(solved);
         for (0..MAP_H) |y| for (0..MAP_W) |x| {
             const i = y * MAP_W + x;
-            // every cell decided, and decided on the open sea at the edges
+            // every cell decided
             try std.testing.expectEqual(@as(u16, 1), @as(u16, @intCast(@popCount(masks[i]))));
-            // the ring is pinned open sea; inland water is free
-            if (x == 0 or y == 0 or x == MAP_W - 1 or y == MAP_H - 1) {
-                try std.testing.expectEqual(DEEP, world[i]);
-            }
             if (x + 1 < MAP_W) try std.testing.expect(adjacent(world[i], world[i + 1]));
             if (y + 1 < MAP_H) try std.testing.expect(adjacent(world[i], world[i + MAP_W]));
         };
