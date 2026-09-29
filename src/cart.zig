@@ -7,7 +7,7 @@
 //! tile -- about 200, not one per map cell.
 const std = @import("std");
 const vex = @import("vex");
-const build_options = @import("build_options");
+const cfg = @import("cfg");
 
 // -- palette ----------------------------------------------------------------
 // JONK 16, applied over the console's default SWEETIE-16 in boot().
@@ -607,7 +607,7 @@ var stack: [CELLS]u16 = undefined;
 var solved: bool = false;
 /// `zig build -Dseed=N` pins this, so `make seeds` can render a spread of
 /// worlds without editing the source between builds.
-var seed: u32 = build_options.seed orelse 0xC0FFEE;
+var seed: u32 = cfg.seed orelse 0xC0FFEE;
 var rng: u32 = 0xC0FFEE;
 var retries: u32 = 0;
 var frame: i32 = 0;
@@ -616,7 +616,7 @@ var cam_y: i32 = 0;
 /// X swaps the scrolling view for the whole world at one pixel per tile.
 /// `zig build -Dmap_view=1` starts there instead, so `make overview` can render
 /// the whole map from the command line with no TTY to press X in.
-var zoomed_out: bool = build_options.map_view;
+var zoomed_out: bool = cfg.map_view;
 /// The mouse API reports held, not just-pressed, so every mouse button needs its
 /// own previous-frame state to find the edge on.
 var mouse_was_down: bool = false;

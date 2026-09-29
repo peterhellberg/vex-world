@@ -51,13 +51,13 @@ pub fn build(b: *std.Build) void {
     // -Dseed=N pins the world the cart boots into, so `make seeds` can render
     // a spread of them without editing src/cart.zig between builds. Unset
     // means the cart's own default.
-    const opts = b.addOptions();
-    opts.addOption(?u32, "seed", seed);
-    opts.addOption(bool, "map_view", map_view orelse false);
+    const cfg = b.addOptions();
+    cfg.addOption(?u32, "seed", seed);
+    cfg.addOption(bool, "map_view", map_view orelse false);
     // The host test build has no build system to generate this module, so it
-    // links src/build_options.zig under the same name instead. src/cart.zig
-    // does not need to know which of the two it got.
-    cart.root_module.addImport("build_options", opts.createModule());
+    // links src/cfg.zig under the same name instead -- src/cart.zig does not
+    // need to know which of the two it got.
+    cart.root_module.addImport("cfg", cfg.createModule());
     cart.entry = .disabled; // no _start; the console calls update()
     cart.rdynamic = true; // export boot()/update()
     b.installArtifact(cart);

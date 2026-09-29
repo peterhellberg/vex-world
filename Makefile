@@ -84,8 +84,8 @@ test: $(ENVLIB)
 		zig build >/dev/null; \
 		SDK=$$(ls zig-pkg/vex-*/vex.zig 2>/dev/null | head -1); \
 	fi; \
-	LD_LIBRARY_PATH=. zig test -target x86_64-linux-gnu --dep vex --dep build_options \
-		-Mroot=src/cart.zig -Mvex=$$SDK -Mbuild_options=src/build_options.zig \
+	LD_LIBRARY_PATH=. zig test -target x86_64-linux-gnu --dep vex --dep cfg \
+		-Mroot=src/cart.zig -Mvex=$$SDK -Mcfg=src/cfg.zig \
 		-L. -l$(ENV)
 
 # The cart's `env` imports are provided by the console at runtime, so the tests

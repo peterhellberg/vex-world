@@ -1,4 +1,4 @@
-//! Fallback for the `build_options` module.
+//! Fallback for the `cfg` module.
 //!
 //! `zig build` generates this module and points src/cart.zig at it, which is
 //! how `-Dseed=N` reaches the cart. This file is what the host test build links
