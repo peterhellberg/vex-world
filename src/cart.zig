@@ -505,7 +505,7 @@ fn buildHeight(salt: u32) void {
     for (0..MAP_H) |y| for (0..MAP_W) |x| {
         const bx = @as(f32, @floatFromInt(x)) / @as(f32, @floatFromInt(MAP_W - 1));
         const by = @as(f32, @floatFromInt(y)) / @as(f32, @floatFromInt(MAP_H - 1));
-        const fall = edgeFall(bx, by);
+        const fall = edgeFall(bx, by) + landMask(bx, by);
         // Warp first, then sample the stack at the displaced point. The warp
         // itself comes from the coarse octave sampled in two far-apart places,
         // so x and y displace independently instead of sliding along one line.
@@ -513,7 +513,17 @@ fn buildHeight(salt: u32) void {
         const wy = (octSample(0, OCTAVES[0].w, bx * 3.0 + 7.7, by * 3.0 + 3.1) - 0.5) * WARP_AMOUNT;
         var sum: f32 = 0;
         for (OCTAVES, 0..) |o, k| {
-            sum += o.amp * octSample(k, 0.0, (bx + wx) * @as(f32, @floatFromInt(o.w)), (by + wy) * @as(f32, @floatFromInt(o.h)));
+            const n = octSample(k, 0.0, (bx + wx) * @as(f32, @floatFromInt(o.w)), (by + wy) * @as(f32, @floatFromInt(o.h)));
+            // Ridged from the second octave up. Folding each octave about its
+            // midpoint turns a smooth blob into sharp crests, which is what
+            // reads as terrain: mountain chains instead of amoeba, and where a
+            // valley between two of them reaches sea level it cuts a fjord
+            // rather than ending in a bay. The coarse octave stays smooth --
+            // ridging it too makes the whole island a fan of spines, and it is
+            // the one that decides the landmass shape. Same mean as the smooth
+            // octave, so sea level still calibrates against the same range.
+            const v = if (k < 2) n else 1.0 - @abs(2.0 * n - 1.0);
+            sum += o.amp * v;
         }
         // Sink the field toward the edges so the map still reads as an island
         // without pinning any tile. The old hard sea ring forced the class back
@@ -536,6 +546,22 @@ fn buildHeight(salt: u32) void {
 /// corners. Radial rather than a distance-to-nearest-edge ramp: that would sink
 /// the map to a rounded rectangle, and the coast would trace the rounded
 /// rectangle. A radial falloff puts the shore on a noise iso-contour instead.
+/// Where the land is allowed to be, as a bias of roughly +/-0.35.
+///
+/// This is what stops the map being one oval. A falloff based on distance from
+/// the centre is a circle whatever noise is piled on it, because every
+/// contour of "distance from a point" is a circle -- so the island is always a
+/// perturbed disc, and the detail octaves only roughen its rim. A land mask at
+/// a much lower frequency than any octave instead decides *where* the land is,
+/// so the coastline follows the mask's contour: big lobes, real bays, and
+/// secondaries that get cut off as islands. Signed, so it can both add land
+/// where the field was thin and take it away where the field was fat.
+fn landMask(bx: f32, by: f32) f32 {
+    // Octave 1 is a 13x8 lattice; sampling it across bx*2 puts barely two cells
+    // over the whole map, which is the point -- this is shape, not detail.
+    return (octSample(1, 0.0, bx * 2.0 + 31.7, by * 2.0 + 17.3) - 0.5) * 1.05;
+}
+
 fn edgeFall(bx: f32, by: f32) f32 {
     const nx = (bx - 0.5) * 2.0;
     const ny = (by - 0.5) * 2.0;
@@ -547,11 +573,11 @@ fn edgeFall(bx: f32, by: f32) f32 {
     // a noise iso-contour, so it bays and points instead of arcing.
     const wobble = (octSample(0, 19.0, bx * 2.0 + 4.3, by * 2.0 + 8.1) - 0.5) * 0.75;
     const t = @min(@max((r + wobble - SHORE_START) / (1.0 - SHORE_START), 0.0), 1.0);
-    return t * t * (3 - 2 * t) * 0.95;
+    return t * t * (3 - 2 * t) * 1.7;
 }
 
 /// Where the shore starts, as a fraction of the half-diagonal.
-const SHORE_START: f32 = 0.80;
+const SHORE_START: f32 = 0.86;
 
 fn noiseVal(x: u32, y: u32, s: u32) f32 {
     return @as(f32, @floatFromInt(hash(x, y, s ^ height_salt) & 0xFFFF)) / 65535.0;
@@ -834,7 +860,7 @@ fn reset(s: u32) u32 {
     height_salt = s;
     buildHeight(s);
     // 0.34..0.52: some worlds are mostly archipelago, some mostly continent
-    sea = 0.34 + @as(f32, @floatFromInt(rnd() % 19)) * 0.01;
+    sea = 0.20 + @as(f32, @floatFromInt(rnd() % 19)) * 0.01;
     for (&masks) |*m| m.* = ALL_TILES;
     // Every cell starts wide open, so start them all in the widest list.
     bucketsClear();
@@ -927,6 +953,7 @@ fn draw() void {
         // just the half of this tile facing it. Only these two sides draw, so
         // the tile earlier in row-major order owns each seam and the blend is
         // one ramp instead of two overlapping.
+        //
         if (bandsWith(t)) {
             for (BAND_DIRS) |d| {
                 const nx = tx + DX[d];
