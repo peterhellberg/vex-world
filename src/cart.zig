@@ -45,6 +45,11 @@ const C = struct {
     const flower: u8 = 11; // #f4dec2 cream
     const forest: u8 = 1; // #455951 dark slate green
     const forest_light: u8 = 2; // #798766 olive, same family as the grass
+    // Deeper in. No new palette entry: the tier is carried by how much canopy
+    // each patch holds, not by a third green. An earlier attempt used the brown
+    // (#704f4f) and read as mud at one pixel per tile -- a different biome, not
+    // a deeper wood. The dither between these two greens is the whole signal.
+    const forest_deep: u8 = 1; // #455951, the same dark green, barely dappled
 
     const sand: u8 = 15; // #ebc790
     const sand_dark: u8 = 14; // #e39669
@@ -52,6 +57,15 @@ const C = struct {
     const rock: u8 = 9; // #95819d dusty purple
     const rock_light: u8 = 4; // #d6d6d6
     const rock_dark: u8 = 12; // #704f4f
+    // The two tiers above the first and the peak between them and snow. A ramp
+    // in *value* from the purple up to near-white is what makes the climb
+    // legible, and there are only 16 slots to spend, so the tiers re-mix tones
+    // already in use rather than claiming new ones. An earlier attempt gave the
+    // scree the sand orange (#e39669) and high ground read as beach.
+    const rock_high: u8 = 4; // #d6d6d6 pale stone
+    // Dark, not pale: the top of a range has to be the most visible part
+    // of it, and the scree below already owns the pale end of the ramp.
+    const peak: u8 = 12; // #704f4f dark stone
 
     const snow: u8 = 5; // #f4f0ea
     const snow_shade: u8 = 4; // #d6d6d6
@@ -90,17 +104,24 @@ const GENERATE_PER_FRAME: usize = @max(64, CELLS / 32);
 
 // -- tiles ------------------------------------------------------------------
 
-const Kind = enum(u8) { deep, shallow, sand, grass, forest, rock, snow, ruins };
+const Kind = enum(u8) { deep, shallow, sand, grass, forest, forest_deep, rock, rock_high, peak, snow, ruins };
 
 const DEEP: u8 = 0;
 const SHALLOW: u8 = 1;
 const SAND: u8 = 2;
 const GRASS: u8 = 3;
 const FOREST: u8 = 4;
-const ROCK: u8 = 5;
-const SNOW: u8 = 6;
-const RUINS: u8 = 7;
-const TILE_COUNT: usize = 8;
+/// Second forest tier. Two levels rather than one so the climb out of the
+/// plains reads as a gradient instead of a single step to a flat green mass.
+const FOREST_DEEP: u8 = 5;
+/// Rock is split three ways, low to high, for the same reason: at one level
+/// the highlands were a single flat purple that gave no sense of rising.
+const ROCK: u8 = 6;
+const ROCK_HIGH: u8 = 7;
+const PEAK: u8 = 8;
+const SNOW: u8 = 9;
+const RUINS: u8 = 10;
+const TILE_COUNT: usize = 11;
 const ALL_TILES: u16 = (@as(u16, 1) << TILE_COUNT) - 1;
 
 /// How many looks each tile kind gets, chosen per map position at draw time so
@@ -137,15 +158,29 @@ const TILES: [TILE_COUNT]Tile = blk: {
         .{ .kind = .deep, .cls = 0, .weight = 6, .only = 0, .name = "DEEP SEA", .map = C.water_deep },
         .{ .kind = .shallow, .cls = 1, .weight = 6, .only = 0, .name = "SHALLOWS", .map = C.water },
         .{ .kind = .sand, .cls = 2, .weight = 5, .only = 0, .name = "BEACH", .map = C.sand },
-        .{ .kind = .grass, .cls = 3, .weight = 100, .only = 0, .name = "PLAINS", .map = C.grass },
+        .{ .kind = .grass, .cls = 3, .weight = 2500, .only = 0, .name = "PLAINS", .map = C.grass },
         .{ .kind = .forest, .cls = 4, .weight = 8, .only = 0, .name = "FOREST", .map = C.forest },
-        .{ .kind = .rock, .cls = 5, .weight = 3, .only = 0, .name = "HIGHLANDS", .map = C.rock },
-        .{ .kind = .snow, .cls = 6, .weight = 2, .only = 0, .name = "SNOWCAP", .map = C.snow },
-        // a landmark: same elevation band as the plains, so it clusters there
-        // instead of speckling the whole map. Weight 1 against plains' 100 is
-        // roughly one ruin per hundred cells, and ruins may touch ruins, so
-        // they settle into little villages rather than singletons.
-        .{ .kind = .ruins, .cls = 3, .weight = 1, .only = bit(SAND) | bit(GRASS) | bit(FOREST) | bit(RUINS), .name = "RUINS", .map = C.roof },
+        .{ .kind = .forest_deep, .cls = 5, .weight = 6, .only = 0, .name = "DEEP FOREST", .map = C.forest_deep },
+        .{ .kind = .rock, .cls = 6, .weight = 4, .only = 0, .name = "HIGHLANDS", .map = C.rock },
+        .{ .kind = .rock_high, .cls = 7, .weight = 3, .only = 0, .name = "HIGH SCREE", .map = C.rock_high },
+        .{ .kind = .peak, .cls = 8, .weight = 2, .only = 0, .name = "PEAKS", .map = C.peak },
+        .{ .kind = .snow, .cls = 9, .weight = 2, .only = 0, .name = "SNOWCAP", .map = C.snow },
+        // A landmark: same elevation band as the plains, so it stays in the
+        // settled lowlands instead of speckling the mountains.
+        //
+        // SAND is deliberately *not* in the whitelist. Ruins can only be
+        // picked where wantClass returns the plains class, which is the bottom
+        // fifth of the land range -- a thin ring that follows the coast. With
+        // beach allowed, every ruin in the world landed in that ring and the
+        // result was a line of houses strung along the shoreline, because a
+        // contour band *is* a coastline. Excluding sand forces them a tile
+        // inland, which is where a ruin belongs anyway.
+        //
+        // The rarity is set by the plains' weight rather than ruins': both are
+        // class 3, so they share a pick pool and the odds are ruins:plains.
+        // At 1:100 that was 162 ruins on one map -- enough to read as a
+        // pattern rather than a landmark. 1:400 puts it near a dozen.
+        .{ .kind = .ruins, .cls = 3, .weight = 1, .only = bit(GRASS) | bit(FOREST) | bit(FOREST_DEEP) | bit(RUINS), .name = "RUINS", .map = C.roof },
     };
     for (&list) |*t| for (0..2) |f| for (0..VARIANTS) |v| {
         t.art[v][f] = tileArt(t.kind, f, v);
@@ -171,6 +206,11 @@ const OPP = [4]usize{ 2, 3, 0, 1 };
 
 /// `ALLOWED[dir][tile]` = every tile that may touch it on that side.
 const ALLOWED: [4][TILE_COUNT]u16 = blk: {
+    // This is a comptime triple loop over dirs x tiles x tiles, so the branch
+    // budget has to cover it. Scaled off TILE_COUNT rather than pinned to a
+    // number, because adding tiles is exactly the edit that overruns it and the
+    // error points at the loop rather than at the tile table.
+    @setEvalBranchQuota(64 * TILE_COUNT * TILE_COUNT);
     var out: [4][TILE_COUNT]u16 = @splat(@splat(0));
     for (0..4) |d| for (0..TILE_COUNT) |a| for (0..TILE_COUNT) |b| {
         if (adjacent(@intCast(a), @intCast(b))) out[d][a] |= @as(u16, 1) << @intCast(b);
@@ -332,7 +372,7 @@ const BANDS: [TILE_COUNT][BAND_DIRS.len][VARIANTS][NP]u8 = blk: {
 };
 
 fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) [NP]u8 {
-    @setEvalBranchQuota(4_000_000);
+    @setEvalBranchQuota(12_000_000);
     var px: [NP]u8 = @splat(0);
     for (0..T) |yy| for (0..T) |xx| {
         const n = hash(@intCast(xx), @intCast(yy), @as(u32, @intFromEnum(kind)) * 977 +%
@@ -375,17 +415,71 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
             // dark canopy a patch holds, and a per-pixel dither lays the pixels
             // down inside it. The dither breaks the block edges, the blocks give
             // the dither shade to vary across, and neither is visible alone.
-            .forest => {
-                const b = hash(xx / 2, yy / 2, 0x5EED +% @as(u32, @intCast(variant)));
+            .forest, .forest_deep => {
+                const b = hash(xx / 2, yy / 2, 0x5EED +% @as(u32, @intCast(variant)) +%
+                    @as(u32, @intFromEnum(kind)) * 13);
                 // how much of the patch is dark canopy: 7 is the shaded tone
                 const dark: u32 = switch (b % 3) {
                     0 => 8, // deep shade
                     1 => 5, // even
                     else => 2, // sunlit, mostly showing the grass beneath
                 };
-                c = if (n % 10 < dark) C.forest else C.forest_light;
+                // The two forest tiers share this dither and differ only in how
+                // much canopy each patch carries, which is the whole point of
+                // the split: same texture, denser, so the eye reads "deeper
+                // into the trees" rather than "a different green appeared". The
+                // deep tier never shows the grass through, so a whole hillside
+                // of it is unbroken canopy where the tier below is dappled.
+                // Denser canopy in the deep tier: barely any grass left to
+                // show through, so a whole hillside of it is unbroken where
+                // the tier below is dappled.
+                const d2: u32 = if (kind == .forest_deep) @min(dark + 4, 10) else dark;
+                c = if (n % 10 < d2) C.forest else C.forest_light;
             },
-            .rock => c = if (n % 13 == 0) C.rock_light else if (n % 19 == 0) C.rock_dark else C.rock,
+            // Two rock tiers from one speckle, so the climb reads as one
+            // material getting paler rather than two unrelated textures.
+            .rock, .rock_high => {
+                c = if (n % 13 == 0) C.rock_light else if (n % 19 == 0) C.rock_dark else C.rock;
+                // paler, and the dark fissures thin out
+                if (kind == .rock_high) c = if (n % 11 == 0) C.rock else C.rock_high;
+            },
+            // Peaks are drawn, not speckled. Everything else in the set is
+            // noise at three scales, and a mountain made of noise is just a
+            // pale patch -- which is exactly how the first version read: PEAKS
+            // were the palest thing on the map and dissolved into the scree
+            // below them, so the top of a range was the least visible part of
+            // it.
+            //
+            // Instead: dark stone, as one or two upward-pointing ridges. The
+            // shape does the work a colour ramp cannot here -- a range should
+            // read as a *profile*, and one lit flank per ridge is what makes a
+            // triangle look like a solid with a top rather than a shape drawn on
+            // a flat tile. Dark also inverts the value order, so the peak is
+            // now the highest-contrast thing up there instead of the least.
+            .peak => {
+                const vy: u32 = @intCast(yy);
+                const vx: u32 = @intCast(xx);
+                const ridges = 1 + hash(@intCast(variant), 7, 0xBEEF) % 2;
+                c = C.rock_dark; // bare ground between the ridges
+                for (0..ridges) |r| {
+                    const h = hash(@intCast(r), @intCast(variant), 0xC0FFEE);
+                    const cx: u32 = 3 + h % 10; // apex column
+                    const half: u32 = 4 + (h >> 6) % 4; // half-width at the base
+                    const top: u32 = (h >> 12) % 5; // where the apex sits
+                    const depth: u32 = 8 + (h >> 18) % 5; // how far down it runs
+                    if (vy < top or vy >= top + depth) continue;
+                    // the cone widens as it descends, so the flank is a slope
+                    const reach = (vy - top) * half / depth;
+                    const dx = if (vx >= cx) vx - cx else cx - vx;
+                    if (dx > reach) continue;
+                    // The right flank catches the light. Both flanks have to
+                    // differ from the background or the shadowed one vanishes
+                    // into it and the cone reads as a sliver: an earlier
+                    // version shaded the left flank with the same dark as the
+                    // ground and drew a wedge, not a mountain.
+                    c = if (vx >= cx) C.rock_light else C.rock;
+                }
+            },
             .snow => c = if (n % 9 == 0) C.snow_shade else if (n % 23 == 0) C.snow_tint else C.snow,
             // Ruins are the one tile in the set that is not noise, which made
             // them the one tile variants did nothing for: every ruin drew the
@@ -616,13 +710,29 @@ fn octSample(k: usize, skip: f32, fx: f32, fy: f32) f32 {
     );
 }
 
+/// The class a cell would ideally be, from its height. These band edges are
+/// the real knobs of the world: they set how much of the map is ocean, how
+/// wide the beaches are, and how much of the highlands is snow.
+///
+/// Land is banded as a *fraction of the way from the shore to the highest
+/// point in this world*, not as a fixed offset from `sea`. A fixed offset only
+/// works while the offset happens to fit: the field is normalised so its tallest
+/// point is 1.0, and `sea` ranges 0.20..0.38, so an edge at `sea + 0.70` landed
+/// off the top of the scale on every high-sea world and the top two bands
+/// simply never appeared. Fractions keep every band reachable at any sea level,
+/// and they scale the whole climb to the land that is actually there.
 fn wantClass(h: f32) u8 {
     if (h < sea) return DEEP;
     if (h < sea + 0.015) return SHALLOW;
     if (h < sea + 0.035) return SAND;
-    if (h < sea + 0.22) return GRASS;
-    if (h < sea + 0.45) return FOREST;
-    if (h < sea + 0.70) return ROCK;
+    // how far up the land this cell sits, 0 at the shore and 1 at the peak
+    const up = (h - sea - 0.035) / @max(1.0 - sea - 0.035, 0.01);
+    if (up < 0.20) return GRASS;
+    if (up < 0.38) return FOREST;
+    if (up < 0.53) return FOREST_DEEP;
+    if (up < 0.67) return ROCK;
+    if (up < 0.79) return ROCK_HIGH;
+    if (up < 0.90) return PEAK;
     return SNOW;
 }
 
