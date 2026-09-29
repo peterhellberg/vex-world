@@ -113,9 +113,11 @@ shot: build
 # Re-dumps every time rather than converting a stale file: the seed and the
 # frame count are in the command line, not in the filename, so make has no way
 # to know the existing dump is out of date.
+# -strip drops the wall-clock timestamp convert writes into every PNG, so two
+# runs of a deterministic render hash identically.
 ## png: dump a frame and convert it to a viewable image
 png: shot
-	@convert -size $(RAWSIZE) -depth 8 rgba:$(SHOT) -scale $(ZOOM)% $(SHOT:.raw=.png)
+	@convert -size $(RAWSIZE) -depth 8 rgba:$(SHOT) -scale $(ZOOM)% -strip $(SHOT:.raw=.png)
 	@echo "-> $(SHOT:.raw=.png)"
 
 ## overview: one PNG of the whole map, e.g. `make overview SEED=0x51ED`
