@@ -93,6 +93,19 @@ const C = struct {
     const ui_text: u8 = 6; // #9b9689
     const ui_bright: u8 = 8; // #eef1ee
     const ui_fill: u8 = 3; // #93a35e
+    // The viewport rectangle on the minimap, near-white. Terracotta was tried
+    // here and was not better: it is the ruins' map colour, and a hue that
+    // says "ruin" on a marker meaning "you are here" is a bad trade for a
+    // little contrast. What makes the marker legible is not the hue but that
+    // it is a hollow frame -- a filled five-by-two block reads as one more
+    // patch of ground whatever colour it is.
+    //
+    // Same index as ui_bright, and as snow, so a white frame over a snowfield
+    // has no hue to spare. It still reads: the snow tile is dithered rather
+    // than flat, and the frame's hollow middle shows that dither through it,
+    // which is a different texture from the solid border. Checked against the
+    // ice cap on the north edge, which is the worst case.
+    const ui_marker: u8 = 8;
 };
 
 // -- world geometry ---------------------------------------------------------
@@ -1213,19 +1226,19 @@ fn drawMinimap() void {
     // Where the viewport is. Clamped on both ends: the camera can sit hard
     // against a map edge, and a marker hanging off the panel would point
     // nowhere.
-    const vw = @max(1, @divTrunc(VIEW_W * MINIMAP_W, @as(i32, @intCast(MAP_W))));
-    const vh = @max(1, @divTrunc(VIEW_H * MINIMAP_H, @as(i32, @intCast(MAP_H))));
-    const vx = std.math.clamp(
-        @divTrunc(@divTrunc(cam_x, @as(i32, @intCast(T))) * MINIMAP_W, @as(i32, @intCast(MAP_W))),
-        0,
-        MINIMAP_W - vw,
-    );
-    const vy = std.math.clamp(
-        @divTrunc(@divTrunc(cam_y, @as(i32, @intCast(T))) * MINIMAP_H, @as(i32, @intCast(MAP_H))),
-        0,
-        MINIMAP_H - vh,
-    );
-    vex.rectb(MINIMAP_X + vx, MINIMAP_Y + vy, vw, vh, C.ui_bright);
+    const m = viewportMarker(cam_x, cam_y);
+    // `rectb` is the outline call -- `rect` is the filled one -- so this was
+    // never a solid block. It looked solid because the viewport is 5x2 minimap
+    // pixels: both rows are border, the outline has no interior, and a hollow
+    // frame and a filled one are the same 10 pixels. Growing the frame by one
+    // pixel gives it a middle, the terrain shows through it, and it reads as a
+    // window instead of as one more patch of ground. Costs one minimap pixel of
+    // accuracy, which is 4 map tiles, on a marker 5 pixels wide to begin with.
+    const fw = m.w + 2;
+    const fh = m.h + 2;
+    const fx = std.math.clamp(m.x - 1, 0, @max(0, MINIMAP_W - fw));
+    const fy = std.math.clamp(m.y - 1, 0, @max(0, MINIMAP_H - fh));
+    vex.rectb(MINIMAP_X + fx, MINIMAP_Y + fy, fw, fh, C.ui_marker);
 }
 
 /// Both HUD hint lines, kept as consts so the fit check below sees them and the
@@ -1295,6 +1308,42 @@ fn mapTileAt(mx: i32, my: i32, ox: i32, oy: i32, w: i32, h: i32) ?TileAt {
 }
 
 /// The full-screen overview's placement, which is the map drawn 1:1.
+const Marker = struct { x: i32, y: i32, w: i32, h: i32 };
+
+/// The visible viewport's rectangle on the minimap, in minimap pixels.
+///
+/// Both edges are scaled and rounded, rather than scaling the near edge and the
+/// size separately. The old form divided the camera by the tile size first to
+/// get a tile index, truncated that, then truncated the tile index onto the
+/// minimap, and took the width from a third truncation. Three roundings, each
+/// biased down and to the left, on a marker five pixels wide: at the centred
+/// camera the viewport really starts at 37.5 and 18.75 minimap pixels and ends
+/// at 42.5 and 21.25, and the marker came out at 37..41 and 18..19 -- a pixel
+/// left of where it belonged and nearer the top edge than the bottom by one and
+/// a half pixels, which reads as the rectangle being in the wrong place.
+fn viewportMarker(cx: i32, cy: i32) Marker {
+    const ti: i32 = @intCast(T);
+    const span_x = @as(i32, @intCast(MAP_W)) * ti;
+    const span_y = @as(i32, @intCast(MAP_H)) * ti;
+    // The size is a constant of the map and the panel, so it is computed from
+    // the constants and never from the camera. Deriving it from both scaled
+    // edges instead -- which is what fixed the placement -- made the height
+    // alternate between 2 and 3 pixels depending on where the camera was, so
+    // the marker visibly changed size as you clicked around the minimap. The
+    // true height is 2.5 pixels; one number has to be wrong and it should be
+    // the same wrong number everywhere.
+    const w = @max(1, @divTrunc(VIEW_W * ti * MINIMAP_W + span_x / 2, span_x));
+    const h = @max(1, @divTrunc(VIEW_H * ti * MINIMAP_H + span_y / 2, span_y));
+    // The position comes from the near edge, rounded, so the marker sits hard
+    // against the panel when the camera is against the map edge.
+    return .{
+        .x = std.math.clamp(@divTrunc(cx * MINIMAP_W + span_x / 2, span_x), 0, MINIMAP_W - w),
+        .y = std.math.clamp(@divTrunc(cy * MINIMAP_H + span_y / 2, span_y), 0, MINIMAP_H - h),
+        .w = w,
+        .h = h,
+    };
+}
+
 fn overviewTileAt(mx: i32, my: i32) ?TileAt {
     return mapTileAt(mx, my, MAP_X, MAP_Y, @intCast(MAP_W), @intCast(MAP_H));
 }
@@ -2289,5 +2338,48 @@ test "every tile's map colour is one its own art actually paints" {
             std.debug.print("\n  {s} is mapped as {d} but never paints it\n", .{ t.name, t.map });
             return error.MapColourNotInArt;
         }
+    }
+}
+
+test "the minimap viewport marker sits where the viewport actually is" {
+    // Left and top at the top-left corner, right and bottom at the far corner:
+    // the marker is a scaled copy of the camera, so both ends have to land on
+    // the ends of the panel.
+    const a = viewportMarker(0, 0);
+    try std.testing.expectEqual(@as(i32, 0), a.x);
+    try std.testing.expectEqual(@as(i32, 0), a.y);
+
+    const b = viewportMarker(MAX_CAM_X, MAX_CAM_Y);
+    try std.testing.expectEqual(MINIMAP_W, b.x + b.w);
+    try std.testing.expectEqual(MINIMAP_H, b.y + b.h);
+
+    // Centred camera, centred marker. This is the case that was wrong: the
+    // marker sat a pixel left of the panel's centre and one and a half pixels
+    // nearer the top than the bottom, from truncating instead of rounding. The
+    // panel is even in both axes, so a marker's own centre lands on a half
+    // pixel; one pixel of slack is the tightest that can hold.
+    const c = viewportMarker(MAX_CAM_X / 2, MAX_CAM_Y / 2);
+    try std.testing.expect(@abs(2 * c.x + c.w - MINIMAP_W) <= 1);
+    try std.testing.expect(@abs(2 * c.y + c.h - MINIMAP_H) <= 1);
+
+    // Constant size at every camera position, which is the regression: sizing
+    // from the two scaled edges gave a height of 2 or 3 depending on position.
+    const base = viewportMarker(0, 0);
+    var g: i32 = 0;
+    while (g <= MAX_CAM_X) : (g += MAX_CAM_X / 8) {
+        const m = viewportMarker(g, MAX_CAM_Y / 2);
+        try std.testing.expectEqual(base.w, m.w);
+        try std.testing.expectEqual(base.h, m.h);
+    }
+
+    // And it tracks the camera rather than sitting still while the world moves.
+    var prev = viewportMarker(0, 0);
+    var y: i32 = 0;
+    while (y <= MAX_CAM_Y) : (y += MAX_CAM_Y / 8) {
+        const m = viewportMarker(MAX_CAM_X / 2, y);
+        try std.testing.expect(m.y >= prev.y);
+        try std.testing.expect(m.y + m.h <= MINIMAP_H);
+        try std.testing.expect(m.w >= 1 and m.h >= 1);
+        prev = m;
     }
 }
