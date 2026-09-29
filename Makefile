@@ -1,14 +1,7 @@
 # vex-world -- build, test and run the cart.
 #
-# The real build lives in build.zig (it owns the vex package dependency and the
-# wasm32-freestanding target). This is a thin front end over it, so there is one
-# place that knows how the cart is compiled.
-#
-# Note the other vex carts build with a bare `zig build-exe` and a curl'd
-# vex.zig. This one does not: it depends on the published vex package, so
-# `zig build` is the only thing that can produce the wasm.
-#
-# `make help` lists the targets.
+# A thin front end over build.zig, which owns the vex package dependency and the
+# wasm32-freestanding target. `make help` lists the targets.
 
 WASM   := zig-out/bin/vex-world.wasm
 FRAMES ?= 300
@@ -19,27 +12,18 @@ SHOT   ?= /tmp/vex-world.raw
 RAWSIZE ?= 320x180
 ZOOM    ?= 200
 
-# SEED pins the world (zig build -Dseed=N). MAP_VIEW=1 pins the cart to the
-# whole-map overview instead of the scrolling view, which is what you want when
-# checking terrain rather than art. Both are compile-time debug hooks: pinning
-# them at build time keeps the render reproducible from the command line, with
-# no TTY and no key simulation.
+# SEED pins the world and MAP_VIEW=1 starts in the whole-map overview. Build-time
+# rather than key-driven, so these targets work with no TTY.
 SEED    ?=
 SEEDS  ?= 0x51ED 0x7A3F 0x2C91 0xFEED 0x1234 0xABCD
 
-# Zig's -D flags want decimal, but hex reads better for seeds, so the seeds are
-# written in hex here and converted on the way in. The two functions use
-# opposite bases, hence the round trip.
+# -D flags want decimal; hex reads better for seeds.
 dec = $(shell printf '%d' $(1))
 SEEDOPT  = $(if $(SEED),-Dseed=$(call dec,$(SEED)),)
 VIEWOPT  = $(if $(filter 1,$(MAP_VIEW)),-Dmap_view=true,)
 
-# The name of the console's host import module. src/env.zig stands in for it,
-# `zig build-lib --name env` turns that into libenv.so, and the tests link it
-# back with -lenv -- so the module name is written down once and the three
-# things that have to agree are derived from it. They used to be spelled out
-# separately (shim.zig / libenv.so / -lenv) and only the middle one was
-# load-bearing, which is how they drifted apart in the first place.
+# The console's host import module. src/env.zig stands in for it, and the tests
+# link it back with -lenv.
 ENV    := env
 ENVLIB := lib$(ENV).so
 
@@ -75,9 +59,8 @@ watch:
 
 ## test: run the checks at the bottom of src/cart.zig on the host
 test: $(ENVLIB)
-	@# The SDK is resolved here rather than in the variable above: make expands
-	@# that once at parse time, so after a distclean it would be empty and the
-	@# test would fail with a confusing error instead of fetching the package.
+	@# The SDK is resolved per-run, not in a variable above: make expands those
+	@# once at parse time, so after a distclean it would be empty.
 	@SDK=$$(ls zig-pkg/vex-*/vex.zig 2>/dev/null | head -1); \
 	if [ -z "$$SDK" ]; then \
 		echo "vex package not fetched -- running 'zig build' first"; \
@@ -88,8 +71,8 @@ test: $(ENVLIB)
 		-Mroot=src/cart.zig -Mvex=$$SDK -Mcfg=src/cfg.zig \
 		-L. -l$(ENV)
 
-# The cart's `env` imports are provided by the console at runtime, so the tests
-# need a stand-in to link against. -lc because the stand-in itself needs libc.
+# The console provides the `env` imports at runtime, so the tests need a stand-in
+# to link against. -lc because the stand-in itself needs libc.
 $(ENVLIB): src/$(ENV).zig
 	@zig build-lib -dynamic --name $(ENV) src/$(ENV).zig -lc
 
@@ -106,15 +89,12 @@ shot: build
 	@vex -n $(FRAMES) --dump $(SHOT) $(WASM)
 	@echo "-> $(SHOT) ($(FRAMES) frames)"
 
-# The overview is the fastest way to judge terrain: it is the whole map at one
-# pixel per tile, so coastlines and biome edges are all visible at once. It is
-# pinned at build time (MAP_VIEW=1) rather than toggled with X, because these
-# targets render from the command line with no TTY and cannot press a key.
-# Re-dumps every time rather than converting a stale file: the seed and the
-# frame count are in the command line, not in the filename, so make has no way
-# to know the existing dump is out of date.
-# -strip drops the wall-clock timestamp convert writes into every PNG, so two
-# runs of a deterministic render hash identically.
+# Always re-dumps: the seed and frame count are in the command line, not the
+# filename, so make cannot know an existing dump is stale.
+#
+# -strip drops the timestamp convert writes into every PNG, so identical renders
+# hash identically. It also drops cHRM/bKGD, which is free -- a PNG without them
+# still reads as sRGB, and the output is pixel-identical.
 ## png: dump a frame and convert it to a viewable image
 png: shot
 	@convert -size $(RAWSIZE) -depth 8 rgba:$(SHOT) -scale $(ZOOM)% -strip $(SHOT:.raw=.png)
