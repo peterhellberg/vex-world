@@ -972,7 +972,7 @@ fn draw() void {
 
     vex.rect(0, HUD_Y, vex.WIDTH, vex.HEIGHT - HUD_Y, C.ui_bg);
     vex.text(say("SEED {X}  {d},{d}  {s}", .{ seed, hx, hy, TILES[hover].name }), 4, HUD_Y + 2, C.ui_text);
-    vex.text("ARROWS OR MOUSE EDGE SCROLL   X MAP   Z NEW", 4, HUD_Y + 11, C.ui_dim);
+    vex.text("ARROWS SCROLL   HOLD MOUSE AT EDGE   X MAP   Z NEW", 4, HUD_Y + 11, C.ui_dim);
 }
 
 /// Map tile under a click in the 1:1 overview, or null if the click landed off
@@ -995,20 +995,18 @@ fn input() void {
     if (vex.down(vex.UP)) cam_y -= speed;
     if (vex.down(vex.DOWN)) cam_y += speed;
 
-    // Edge scrolling. Not in the overview: there the whole island is already on
-    // screen and the mouse is over the map, so screen edges mean nothing and
-    // the camera would drift for no reason.
-    //
-    // Gated on the position being on screen at all. The console keeps reporting
-    // a pointer when the window is not focused, and that value is not a screen
-    // coordinate -- a negative one extrapolates into a scroll and walks the
-    // camera up and to the left the moment the cart starts.
-    //
-    // Measured over the whole screen, HUD included. Measuring against the map
-    // area instead leaves the bottom strip dead, and the lowest place you can
-    // scroll from is then the last map row rather than the bottom of the
-    // screen -- which reads as the bottom row being off by one.
-    if (!zoomed_out and mouseOnScreen()) {
+    // Read the button once: edge scrolling and the overview click both want it,
+    // and two reads of a "held" state is two chances to disagree.
+    const held = vex.mdown(vex.MOUSE_LEFT);
+    const clicked = held and !mouse_was_down;
+    mouse_was_down = held;
+
+    // Edge scrolling, while the button is held -- see edgeScrollAllowed for why
+    // each of the three conditions is there. Measured over the whole screen, HUD
+    // included: measuring against the map area instead leaves the bottom strip
+    // dead, and the lowest place you can scroll from is then the last map row
+    // rather than the bottom of the screen, which reads as being off by one.
+    if (edgeScrollAllowed(zoomed_out, held, mouseOnScreen())) {
         cam_x += edgeScroll(vex.mx(), vex.WIDTH);
         cam_y += edgeScroll(vex.my(), vex.HEIGHT);
     }
@@ -1016,10 +1014,7 @@ fn input() void {
     // Clicking the overview moves the viewport box there, the same job the arrow
     // keys do, so the map is usable without hunting for a key that matches the
     // direction you want. The mouse API has no "just pressed", only held, so the
-    // edge is detected here.
-    const held = vex.mdown(vex.MOUSE_LEFT);
-    const clicked = held and !mouse_was_down;
-    mouse_was_down = held;
+    // edge is detected above.
     if (zoomed_out and clicked and mouseOnScreen()) {
         if (overviewTileAt(vex.mx(), vex.my())) |t| {
             const ti: i32 = @intCast(T);
@@ -1052,6 +1047,23 @@ const EDGE_SPEED: i32 = 4;
 fn mouseOnScreen() bool {
     return vex.mx() >= 0 and vex.mx() < vex.WIDTH and
         vex.my() >= 0 and vex.my() < vex.HEIGHT;
+}
+
+/// Whether the mouse should move the camera this frame. Split out from input()
+/// so the rule is one named thing rather than a condition buried in a block of
+/// camera maths -- the button is the part that is easy to drop, and a dropped
+/// `held` is invisible: the cart still runs, it just slides away on its own as
+/// soon as the pointer rests near an edge.
+///
+/// Split three ways because all three are load-bearing. `zoomed_out`: the whole
+/// map is already on screen, so there is nowhere to scroll to. `held`: a
+/// pointer resting near an edge is not a request to move, and the cart boots
+/// wherever the pointer happens to be -- with the button ignored, a pointer left
+/// in the top left walked the camera off the map before anyone had touched
+/// anything. `on_screen`: an unfocused window still reports a position that is
+/// not a screen coordinate, and a negative one extrapolates into a scroll.
+fn edgeScrollAllowed(zoomed: bool, held: bool, on_screen: bool) bool {
+    return !zoomed and held and on_screen;
 }
 
 /// Scroll speed for a cursor `m` px along an axis of `extent` px: zero away
@@ -1573,4 +1585,24 @@ test "the entropy lists stay consistent with the cells they hold" {
     } else {
         for (0..CELLS) |i| try std.testing.expect(@popCount(masks[i]) == 1);
     }
+}
+
+test "the mouse only moves the camera while the button is held" {
+    // The bug this guards: a pointer resting near a screen edge used to be
+    // enough. The cart boots with the pointer wherever the console last left
+    // it, so an unfocused window reporting (0, 0) walked the camera to the top
+    // left of the map and kept going -- no input, no visible cause.
+    //
+    // Held is checked before anything else that could permit a scroll, so the
+    // truth table below is the whole rule: any `held` of false means no
+    // movement, whatever the other two are.
+    try std.testing.expect(!edgeScrollAllowed(false, false, false));
+    try std.testing.expect(!edgeScrollAllowed(false, false, true));
+    try std.testing.expect(!edgeScrollAllowed(true, false, false));
+    try std.testing.expect(!edgeScrollAllowed(true, false, true));
+    // And the ways it *is* allowed, so the check cannot pass by always
+    // returning false.
+    try std.testing.expect(edgeScrollAllowed(false, true, true));
+    try std.testing.expect(!edgeScrollAllowed(true, true, true)); // nothing to scroll to
+    try std.testing.expect(!edgeScrollAllowed(false, true, false)); // off-screen pointer
 }
