@@ -615,6 +615,9 @@ var cam_x: i32 = 0;
 var cam_y: i32 = 0;
 /// X swaps the scrolling view for the whole world at one pixel per tile.
 var zoomed_out: bool = false;
+/// The mouse API reports held, not just-pressed, so the click edge is detected
+/// by keeping the previous frame's state.
+var mouse_was_down: bool = false;
 
 /// Top-left of the 1:1 overview, centred in the area above the HUD.
 const MAP_X: i32 = (vex.WIDTH - @as(i32, @intCast(MAP_W))) / 2;
@@ -866,6 +869,18 @@ fn solve(budget: usize) u32 {
     return 0;
 }
 
+/// Map tile under a click in the 1:1 overview, or null if the click landed off
+/// the map -- on the frame, or on the HUD. Null matters: a click just past the
+/// edge would otherwise recentre on a tile far off the island, and the camera
+/// would jump somewhere the player never pointed at.
+fn overviewTileAt(mx: i32, my: i32) ?struct { x: i32, y: i32 } {
+    const x = mx - MAP_X;
+    const y = my - MAP_Y;
+    if (x < 0 or y < 0) return null;
+    if (x >= @as(i32, @intCast(MAP_W)) or y >= @as(i32, @intCast(MAP_H))) return null;
+    return .{ .x = x, .y = y };
+}
+
 // -- draw -------------------------------------------------------------------
 
 // The `:0` gives the buffer a sentinel slot, and `say` writes the NUL itself:
@@ -936,22 +951,37 @@ fn draw() void {
         }
     };
 
-    // The mouse can sit below the last map row (over the HUD, or in the sliver
-    // past the map at max camera), so clamp the tile we look up or this reads
-    // out of bounds. Outline the pointed-at tile in white, but only while the
-    // cursor is actually over the map -- otherwise it would mark a clamped
-    // tile the player is not pointing at. Drawn before the HUD strip so a
-    // highlight on the bottom row cannot spill onto it.
-    const hx = @divTrunc(cam_x + vex.mx(), t_i);
-    const hy = @min(@divTrunc(cam_y + vex.my(), t_i), @as(i32, @intCast(MAP_H)) - 1);
-    if (vex.my() < HUD_Y) {
-        vex.rectb(hx * t_i - cam_x, hy * t_i - cam_y, t_i, t_i, C.ui_bright);
+    // The console reports a pointer position even when the window does not have
+    // focus, and that position is not a screen coordinate -- it can be negative,
+    // or past the far edge. Feed it to the map only when it really is on screen:
+    // an out-of-range one extrapolates into a scroll (sending the camera off to
+    // a corner the moment the window opens) and reads the map out of bounds.
+    // Clamped rather than discarded, so the HUD still shows a valid tile.
+    const mx = std.math.clamp(vex.mx(), 0, vex.WIDTH - 1);
+    const my = std.math.clamp(vex.my(), 0, vex.HEIGHT - 1);
+    const hx = @divTrunc(cam_x + mx, t_i);
+    const hy = @min(@divTrunc(cam_y + my, t_i), @as(i32, @intCast(MAP_H)) - 1);
+    const hover: u8 = world[@as(usize, @intCast(hy)) * MAP_W + @as(usize, @intCast(hx))];
+    // Outline the pointed-at tile only while the button is held and the cursor
+    // is over the map. Held, because edge scrolling moves the world under a
+    // stationary cursor, so the tile under it changes every frame the camera
+    // creeps and the outline strobes. Pressed-to-inspect, the highlight is
+    // something you go and get rather than something that follows you around.
+    //
+    // Two rings. The inner one is the tile's own primary tone, which ties the
+    // marker to the terrain rather than sitting on top of it -- but an outline
+    // in a tile's own colour is by definition near-zero contrast against that
+    // tile, and vanished outright on the plains, which are one flat tone. The
+    // outer ring is a pixel beyond the tile, so it is drawn on the *neighbours*
+    // and keeps a visible boundary whatever they happen to be.
+    if (my < HUD_Y and vex.mdown(vex.MOUSE_LEFT)) {
+        vex.rectb(hx * t_i - cam_x - 1, hy * t_i - cam_y - 1, t_i + 2, t_i + 2, C.ui_bright);
+        vex.rectb(hx * t_i - cam_x, hy * t_i - cam_y, t_i, t_i, TILES[hover].map);
     }
 
     vex.rect(0, HUD_Y, vex.WIDTH, vex.HEIGHT - HUD_Y, C.ui_bg);
-    const hover: u8 = world[@as(usize, @intCast(hy)) * MAP_W + @as(usize, @intCast(hx))];
     vex.text(say("SEED {X}  {d},{d}  {s}", .{ seed, hx, hy, TILES[hover].name }), 4, HUD_Y + 2, C.ui_text);
-    vex.text("ARROWS SCROLL   X MAP   Z NEW WORLD", 4, HUD_Y + 11, C.ui_dim);
+    vex.text("ARROWS OR MOUSE EDGE SCROLL   X MAP   Z NEW", 4, HUD_Y + 11, C.ui_dim);
 }
 
 fn input() void {
@@ -964,6 +994,39 @@ fn input() void {
     if (vex.down(vex.RIGHT)) cam_x += speed;
     if (vex.down(vex.UP)) cam_y -= speed;
     if (vex.down(vex.DOWN)) cam_y += speed;
+    // Edge scrolling. Not in the overview: there the whole island is already on
+    // screen and the mouse is over the map, so screen edges mean nothing and
+    // the camera would drift for no reason.
+    //
+    // Gated on the position being on screen at all. The console keeps reporting
+    // a pointer when the window is not focused, and that value is not a screen
+    // coordinate -- a negative one extrapolates into a scroll and walks the
+    // camera up and to the left the moment the cart starts.
+    //
+    // Measured over the whole screen, HUD included. Measuring against the map
+    // area instead leaves the bottom strip dead, and the lowest place you can
+    // scroll from is then the last map row rather than the bottom of the
+    // screen -- which reads as the bottom row being off by one.
+    if (!zoomed_out and mouseOnScreen()) {
+        cam_x += edgeScroll(vex.mx(), vex.WIDTH);
+        cam_y += edgeScroll(vex.my(), vex.HEIGHT);
+    }
+
+    // Clicking the overview moves the viewport box there, the same job the arrow
+    // keys do, so the map is usable without hunting for a key that matches the
+    // direction you want. The mouse API has no "just pressed", only held, so the
+    // edge is detected here.
+    const held = vex.mdown(vex.MOUSE_LEFT);
+    const clicked = held and !mouse_was_down;
+    mouse_was_down = held;
+    if (zoomed_out and clicked and mouseOnScreen()) {
+        if (overviewTileAt(vex.mx(), vex.my())) |t| {
+            const ti: i32 = @intCast(T);
+            cam_x = (t.x - @divTrunc(VIEW_W, 2)) * ti;
+            cam_y = (t.y - @divTrunc(VIEW_H, 2)) * ti;
+        }
+    }
+
     cam_x = std.math.clamp(cam_x, 0, MAX_CAM_X);
     cam_y = std.math.clamp(cam_y, 0, MAX_CAM_Y);
     if (vex.pressed(vex.Z)) {
@@ -972,6 +1035,47 @@ fn input() void {
         cam_x = MAX_CAM_X / 2;
         cam_y = MAX_CAM_Y / 2;
     }
+}
+
+/// How close to an edge the mouse has to be before the camera scrolls, and how
+/// fast it goes at the very edge (px/frame).
+const EDGE: i32 = 24;
+const EDGE_SPEED: i32 = 4;
+
+/// Is the pointer actually within the screen? The console reports a position
+/// whether or not the window has focus, and that position is not a screen
+/// coordinate when the pointer is elsewhere -- it can be negative or past the
+/// far edge. Anything derived from it has to be gated on this, or it will
+/// extrapolate: as a scroll that walks the camera into a corner, as a tile index
+/// that reads the map out of bounds.
+fn mouseOnScreen() bool {
+    return vex.mx() >= 0 and vex.mx() < vex.WIDTH and
+        vex.my() >= 0 and vex.my() < vex.HEIGHT;
+}
+
+/// Scroll speed for a cursor `m` px along an axis of `extent` px: zero away
+/// from the edges, ramping to +/-EDGE_SPEED pinned to them. Ramped rather than
+/// constant so nudging the mouse to an edge drifts gently instead of lurching.
+///
+/// Signed, and that is the whole point: the speed has to point *away* from the
+/// edge the cursor is against. Returning a bare magnitude and letting the
+/// caller add it means both edges scroll the same direction, and the camera
+/// can then only ever travel one way along each axis -- which is a silent,
+/// very confusing half-broken control rather than an obvious failure.
+///
+/// `m` must be within `[0, extent-1]`, which is what the mouse reads over the
+/// full screen, so nothing extrapolates past the far edge. The one axis that
+/// was not a clean match was y: the HUD strip sits below the map, and measuring
+/// against the map area alone would have pushed `m` past `extent - 1`.
+fn edgeScroll(m: i32, extent: i32) i32 {
+    // Magnitude ramps from 0 at the inner edge of the margin to EDGE_SPEED at
+    // the screen edge -- so it is measured from the margin inward on both
+    // sides. Measuring from the screen edge instead makes the cursor pinned
+    // against the screen get *zero* speed, which reads as the control not
+    // working at all.
+    if (m < EDGE) return -@divTrunc(EDGE_SPEED * (EDGE - m), EDGE);
+    if (m > extent - 1 - EDGE) return @divTrunc(EDGE_SPEED * (m - (extent - 1 - EDGE)), EDGE);
+    return 0;
 }
 
 export fn boot() void {
@@ -1351,4 +1455,103 @@ test "the map fits the screen, and its cell indices fit the sentinel" {
     // The bucket lists use u16 indices and NO_CELL as a terminator, so a map
     // at or past 0xFFFF cells would alias a real cell onto the terminator.
     try std.testing.expect(CELLS < NO_CELL);
+}
+
+test "edge scroll is signed and points away from the edge it is against" {
+    // Idle away from the edges, so the world does not creep under a still cursor.
+    try std.testing.expectEqual(@as(i32, 0), edgeScroll(EDGE, vex.WIDTH));
+    try std.testing.expectEqual(@as(i32, 0), edgeScroll(vex.WIDTH - 1 - EDGE, vex.WIDTH));
+    try std.testing.expectEqual(@as(i32, 0), edgeScroll(vex.WIDTH / 2, vex.WIDTH));
+    try std.testing.expectEqual(@as(i32, 0), edgeScroll(vex.HEIGHT / 2, vex.HEIGHT));
+
+    // Full speed pinned to each edge, and pointing the right way: the cursor on
+    // the left of the screen has to scroll the camera left, not right. Getting
+    // this sign wrong is a silent half-control -- the camera only travels one
+    // way along the axis and nothing looks broken enough to notice.
+    try std.testing.expectEqual(-EDGE_SPEED, edgeScroll(0, vex.WIDTH));
+    try std.testing.expectEqual(EDGE_SPEED, edgeScroll(vex.WIDTH - 1, vex.WIDTH));
+    // y is measured over the full screen, HUD strip included, so the very
+    // bottom row of the screen scrolls down rather than the last row of the map
+    // doing it instead
+    try std.testing.expectEqual(-EDGE_SPEED, edgeScroll(0, vex.HEIGHT));
+    try std.testing.expectEqual(EDGE_SPEED, edgeScroll(vex.HEIGHT - 1, vex.HEIGHT));
+
+    // Left ramp, walking from the margin out to the edge: never positive, and
+    // the speed grows as the cursor nears the edge.
+    var prev = edgeScroll(EDGE, vex.WIDTH);
+    try std.testing.expectEqual(@as(i32, 0), prev);
+    for (1..EDGE + 1) |d| {
+        const s = edgeScroll(@intCast(EDGE - d), vex.WIDTH);
+        try std.testing.expect(s <= prev);
+        try std.testing.expect(s <= 0);
+        try std.testing.expect(s >= -EDGE_SPEED);
+        prev = s;
+    }
+    try std.testing.expectEqual(-EDGE_SPEED, prev); // at m = 0
+
+    // Right ramp, same walk, and never negative.
+    var prev_r = edgeScroll(vex.WIDTH - 1 - EDGE, vex.WIDTH);
+    try std.testing.expectEqual(@as(i32, 0), prev_r);
+    for (1..EDGE + 1) |d| {
+        const s = edgeScroll(@intCast(vex.WIDTH - 1 - EDGE + d), vex.WIDTH);
+        try std.testing.expect(s >= prev_r);
+        try std.testing.expect(s >= 0);
+        try std.testing.expect(s <= EDGE_SPEED);
+        prev_r = s;
+    }
+    try std.testing.expectEqual(EDGE_SPEED, prev_r); // at m = WIDTH-1
+}
+
+test "edge scroll never reverses anywhere the mouse can actually reach" {
+    // The sign is the whole control: negative scrolls toward 0, positive toward
+    // the far edge. A cursor position producing the opposite sign would send the
+    // camera the wrong way, and since it is a whole number of pixels either side
+    // of a boundary, it reads as a dead row rather than as a bug.
+    //
+    // The mouse ranges over [0, extent-1] and nothing more, so that is exactly
+    // what gets swept -- an off-by-one at either end is enough to flip a sign.
+    //
+    // Zero is allowed throughout the margins: with only EDGE_SPEED steps to
+    // spend, the inner few pixels of the easing zone round down to no movement
+    // at all, which is the intended ramp, not a fault.
+    inline for (.{ vex.WIDTH, vex.HEIGHT }) |extent| {
+        var m: i32 = 0;
+        while (m < extent) : (m += 1) {
+            const s = edgeScroll(m, extent);
+            if (m < EDGE) {
+                try std.testing.expect(s <= 0);
+            } else if (m <= extent - 1 - EDGE) {
+                try std.testing.expectEqual(@as(i32, 0), s);
+            } else {
+                try std.testing.expect(s >= 0);
+            }
+        }
+    }
+    // and the dead zone really is dead: the whole middle of both axes
+    try std.testing.expectEqual(@as(i32, 0), edgeScroll(EDGE, vex.WIDTH));
+    try std.testing.expectEqual(@as(i32, 0), edgeScroll(vex.WIDTH - 1 - EDGE, vex.WIDTH));
+    try std.testing.expectEqual(@as(i32, 0), edgeScroll(EDGE, vex.HEIGHT));
+    try std.testing.expectEqual(@as(i32, 0), edgeScroll(vex.HEIGHT - 1 - EDGE, vex.HEIGHT));
+}
+
+test "clicking the overview picks the tile under the pointer, and only that" {
+    // On the map: it is drawn 1:1, so the tile is the offset from the origin.
+    // Derived from the map constants rather than hardcoded, so it stays honest
+    // if the map is resized -- at 320x160 the map fills the area exactly and
+    // there is no longer any screen point that is off the left or top of it.
+    const tl = overviewTileAt(MAP_X, MAP_Y).?;
+    try std.testing.expectEqual(@as(i32, 0), tl.x);
+    try std.testing.expectEqual(@as(i32, 0), tl.y);
+    const br = overviewTileAt(MAP_X + @as(i32, @intCast(MAP_W)) - 1, MAP_Y + @as(i32, @intCast(MAP_H)) - 1).?;
+    try std.testing.expectEqual(@as(i32, @intCast(MAP_W)) - 1, br.x);
+    try std.testing.expectEqual(@as(i32, @intCast(MAP_H)) - 1, br.y);
+
+    // One pixel past any edge is off the map, and must be refused rather than
+    // recentring on a tile the player never pointed at.
+    try std.testing.expect(overviewTileAt(MAP_X - 1, MAP_Y) == null);
+    try std.testing.expect(overviewTileAt(MAP_X, MAP_Y - 1) == null);
+    try std.testing.expect(overviewTileAt(MAP_X + @as(i32, @intCast(MAP_W)), MAP_Y) == null);
+    try std.testing.expect(overviewTileAt(MAP_X, MAP_Y + @as(i32, @intCast(MAP_H))) == null);
+    // the HUD strip sits below the map and is not part of it
+    try std.testing.expect(overviewTileAt(0, HUD_Y) == null);
 }

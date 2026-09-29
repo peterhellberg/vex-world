@@ -48,3 +48,7 @@ export fn mx() i32 {
 export fn my() i32 {
     return 0;
 }
+export fn mbtn(button: i32) i32 {
+    _ = button;
+    return 0;
+}
