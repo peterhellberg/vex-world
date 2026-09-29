@@ -684,8 +684,44 @@ var oct_pool: [OCT_POOL]f32 = undefined;
 /// itself and puts inland lakes in the wrong place.
 const WARP_AMOUNT: f32 = 0.18;
 
-var height: [CELLS]f32 = @splat(0);
+/// The height field, quantised to 16 bits.
+///
+/// `buildHeight` needs to know the map's tallest peak before it can normalise
+/// anything, so it writes the raw field once and divides it by that peak on a
+/// second pass -- and holding the field as f32 across both passes cost 200 KB,
+/// a quarter of everything the map spends. The field is only ever read back
+/// through `wantClass`, which compares it against seven fixed thresholds, so
+/// the precision was never buying anything.
+///
+/// The range is bounded rather than measured, which is what makes 16 bits safe
+/// to reason about. The octave amplitudes sum to exactly 1 and every octave
+/// stays in [0,1], so `sum` is in [0,1]. `fall` is `edgeFall + landMask`, and
+/// the landMask term is signed: (n - 0.5) * 1.05 puts it in [-0.525, 0.525]
+/// while edgeFall is smoothstep * 1.7 in [0, 1.7]. So `fall` is in
+/// [-0.525, 2.225] and `sum - fall` is in [-2.225, 1.525].
+///
+/// The top of that is 1.525, not 1.0, and getting it wrong is not subtle. A
+/// window of [-2.25, 1.0] clamps the top 3.7% of all cells onto a single value,
+/// and because that value is also the normaliser they all then read as exactly
+/// 1.0 -- which is SNOWCAP. Every highland in every world turned into one white
+/// blob. The bounds below leave headroom at the top for that reason, and a test
+/// fails if anything ever saturates them again.
+const H_LO: f32 = -2.25;
+const H_HI: f32 = 1.6;
+const H_SCALE: f32 = 65535.0 / (H_HI - H_LO);
+
+var hq: [CELLS]u16 = @splat(0);
+/// The tallest cell, in the same quantised units, so the normalisation divides
+/// by a peak it can actually read back rather than one it no longer stores.
+var peak_q: u16 = 0;
 var height_salt: u32 = 0;
+
+/// The normalised height of cell `i`, as `wantClass` wants to see it.
+fn heightAt(i: usize) f32 {
+    const raw = @as(f32, @floatFromInt(hq[i])) / H_SCALE + H_LO;
+    const pk = @as(f32, @floatFromInt(peak_q)) / H_SCALE + H_LO;
+    return raw / pk;
+}
 
 fn buildHeight(salt: u32) void {
     for (OCTAVES, 0..) |o, k| {
@@ -693,7 +729,7 @@ fn buildHeight(salt: u32) void {
             oct_pool[OCT_OFF[k] + i] = noiseVal(@intCast(i % o.w), @intCast(i / o.w), salt +% @as(u32, @intCast(k)) *% 0x9E37);
         }
     }
-    var peak: f32 = 0;
+    var peak: u16 = 0;
     for (0..MAP_H) |y| for (0..MAP_W) |x| {
         const bx = @as(f32, @floatFromInt(x)) / @as(f32, @floatFromInt(MAP_W - 1));
         const by = @as(f32, @floatFromInt(y)) / @as(f32, @floatFromInt(MAP_H - 1));
@@ -722,16 +758,17 @@ fn buildHeight(salt: u32) void {
         // one step per tile from the border, and that constant gradient is what
         // drew straight beaches. Folding the falloff into the *height* instead
         // means the coast sits on a noise iso-contour, so it wiggles.
+        // Scale against this world's own tallest peak. The raw field tops out
+        // wherever the lattice rolled, so fixed thresholds would leave snow and
+        // rock unreachable on a flat roll and swallow the map on a spiky one.
         const h = sum - fall;
-        height[y * MAP_W + x] = h;
-        peak = @max(peak, h);
+        const q: u16 = @intFromFloat(std.math.clamp((h - H_LO) * H_SCALE, 0, 65535));
+        hq[y * MAP_W + x] = q;
+        peak = @max(peak, q);
     };
-    // Scale against this world's own tallest peak. The raw field tops out
-    // wherever the lattice rolled, so fixed thresholds would leave snow and
-    // rock unreachable on a flat roll and swallow the map on a spiky one.
-    if (peak > 0) {
-        for (&height) |*h| h.* /= peak;
-    }
+    // The tallest cell still normalises to exactly 1.0, because the peak is
+    // read back out of the same quantised units the field is stored in.
+    peak_q = peak;
 }
 
 /// How much to sink the field near the edges, 0 in the middle and past 1 in the
@@ -837,7 +874,17 @@ fn wantClass(h: f32) u8 {
 var masks: [CELLS]u16 = @splat(ALL_TILES); // tiles still allowed per cell
 var world: [CELLS]u8 = @splat(DEEP); // the chosen tile, valid once solved
 var queued: [CELLS]bool = @splat(false);
-var stack: [CELLS]u16 = undefined;
+/// The propagation stack, which was sized for the worst case at 100 KB and
+/// used sixteen entries of it.
+///
+/// Propagation from a single collapse turns out to be very local, and very
+/// shallow: across 300 unrelated seeds the deepest it ever got was 16, and it
+/// never exceeded 32. That is not the same as a bound, so the size here is 64x
+/// the observed maximum and the push is checked anyway -- an overflow reports a
+/// contradiction and the solve re-rolls, which is a wasted world rather than a
+/// silent write past the end of the array.
+const STACK_MAX: usize = 1024;
+var stack: [STACK_MAX]u16 = undefined;
 var solved: bool = false;
 /// `zig build -Dseed=N` pins this, so `make seeds` can render a spread of
 /// worlds without editing the source between builds.
@@ -1023,6 +1070,7 @@ fn propagate(start: usize) bool {
                 // entropy list than the one it was on
                 bucketRequeue(n, @intCast(@popCount(next)));
                 if (!queued[n]) {
+                    if (sp == STACK_MAX) return false; // see STACK_MAX
                     queued[n] = true;
                     stack[sp] = @intCast(n);
                     sp += 1;
@@ -1033,12 +1081,12 @@ fn propagate(start: usize) bool {
     return true;
 }
 
-/// A tile from `mask` for cell `i`, aimed at the elevation `height[i]` wants.
+/// A tile from `mask` for cell `i`, aimed at the elevation cell `i` wants.
 /// The closest class always wins; where two tiles share that class (plains and
 /// ruins are both class 3) the weight decides, so ruins stay rare. Picking on
 /// weight alone gives a map of static, not a world.
 fn pickTile(i: usize, mask: u16) u8 {
-    if (wantClass(height[i]) >= GRASS and (mask & bit(RUINS)) != 0 and rnd() % RUIN_ODDS == 0) {
+    if (wantClass(heightAt(i)) >= GRASS and (mask & bit(RUINS)) != 0 and rnd() % RUIN_ODDS == 0) {
         return RUINS;
     }
     return pickTerrain(i, mask);
@@ -1047,7 +1095,7 @@ fn pickTile(i: usize, mask: u16) u8 {
 /// The class-aimed pick, with ruins rolled separately in pickTile. Split out so
 /// the aim can be checked on its own, without a ruin roll landing on top of it.
 fn pickTerrain(i: usize, mask: u16) u8 {
-    const want = wantClass(height[i]);
+    const want = wantClass(heightAt(i));
 
     // Ruins are a landmark, not a terrain, and are not chosen by elevation at
     // all. They used to be picked by the class rule below, which meant they
@@ -1100,6 +1148,11 @@ fn reset(s: u32) u32 {
     // 0.34..0.52: some worlds are mostly archipelago, some mostly continent
     sea = 0.20 + @as(f32, @floatFromInt(rnd() % 19)) * 0.01;
     for (&masks) |*m| m.* = ALL_TILES;
+    // A contradiction returns out of the middle of a propagation, so whatever
+    // was still on the stack is left flagged. Nothing has ever hit that path,
+    // which is why it went unnoticed; clearing here makes the re-roll start
+    // from a clean slate instead of from cells that think they are queued.
+    for (&queued) |*q| q.* = false;
     // Every cell starts wide open, so start them all in the widest list.
     bucketsClear();
     for (0..CELLS) |i| bucketLink(i, MAX_ENTROPY);
@@ -1684,12 +1737,12 @@ test "the picked tile is allowed and as close to the aim as possible" {
         // wanted class is a contour, so aiming them put every ruin in the
         // world on the same one. Masked off here so this check stays about the
         // terrain aim, and the ruin behaviour is checked on its own below.
-        const t_free = if (wantClass(height[i]) >= GRASS and rnd() % RUIN_ODDS == 0)
+        const t_free = if (wantClass(heightAt(i)) >= GRASS and rnd() % RUIN_ODDS == 0)
             RUINS
         else
             pickTerrain(i, ALL_TILES);
         if (t_free == RUINS) continue;
-        try std.testing.expectEqual(TILES[t_free].cls, wantClass(height[i]));
+        try std.testing.expectEqual(TILES[t_free].cls, wantClass(heightAt(i)));
 
         // a real cell: the pick must come out of the options propagation left
         const m = masks[i];
@@ -1703,8 +1756,8 @@ test "the picked tile is allowed and as close to the aim as possible" {
                 reachable = @min(reachable, TILES[k].cls);
             }
         }
-        const d_want = @abs(@as(i32, wantClass(height[i])) - @as(i32, reachable));
-        const d_got = @abs(@as(i32, TILES[t].cls) - @as(i32, wantClass(height[i])));
+        const d_want = @abs(@as(i32, wantClass(heightAt(i))) - @as(i32, reachable));
+        const d_got = @abs(@as(i32, TILES[t].cls) - @as(i32, wantClass(heightAt(i))));
         try std.testing.expect(d_got <= d_want);
     }
 }
@@ -2230,6 +2283,28 @@ test "every generating phrase fits, and the list is worth having" {
     try std.testing.expect(distinct > 4);
 }
 
+test "the height encoding window holds the whole field" {
+    // The field is stored as a u16 across [H_LO, H_HI], and anything outside
+    // that window is clamped onto the end stop. Clamping is not a rounding
+    // error, it is a corruption of the *shape* of the terrain: the end stop is
+    // also the normaliser, so every clamped cell reads back as exactly 1.0,
+    // which is SNOWCAP. With the window 0.6 too narrow, 3.7% of all cells
+    // saturated and every highland in every world became one white blob --
+    // and every distribution test still passed, because a bigger snow tier
+    // balanced against a bigger smallest tier and the 12:1 ratio held.
+    //
+    // So this asserts the thing itself rather than its symptom: nothing sits on
+    // either end stop, and the peak is strictly inside the window.
+    for ([_]u32{ 0x51ED, 0x7A3F, 0x2C91, 0xFEED, 0x1234, 0xABCD, 0xC0FFEE }) |s| {
+        _ = reset(s);
+        try std.testing.expect(peak_q > 0 and peak_q < 65535);
+        for (hq) |q| {
+            try std.testing.expect(q != 0);
+            try std.testing.expect(q != 65535);
+        }
+    }
+}
+
 test "every elevation tier gets a visible share of the land" {
     // The tiers were all reachable and the palette ramp was correct, and the
     // highlands still read as one flat colour -- because the band edges gave
@@ -2274,6 +2349,11 @@ test "every elevation tier gets a visible share of the land" {
         hi = @max(hi, s2);
     }
     try std.testing.expect(hi / lo < 12.0);
+    // The ratio above is necessary but not sufficient: a tier that grows steals
+    // from the others, so a snow blob grew the smallest tier too and the ratio
+    // held. The ceiling is what actually sees it. Forest is the largest land
+    // tier at 12.5% of the map; the broken window put snow past 25%.
+    try std.testing.expect(hi < 20.0);
 }
 test "the small minimap sits on screen and clear of the HUD" {
     // The panel has to be fully on screen and clear of the HUD, which is drawn
@@ -2386,7 +2466,7 @@ test "ruins are rare, spread across the land, and never on the beach" {
             if (world[i] != RUINS) continue;
             per_map += 1;
             ruins += 1;
-            want_hist[wantClass(height[i])] += 1;
+            want_hist[wantClass(heightAt(i))] += 1;
             const x = i % MAP_W;
             const y = i / MAP_W;
             if (x + 1 < MAP_W and world[i + 1] == SAND) on_sand += 1;
