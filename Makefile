@@ -12,15 +12,16 @@ SHOT   ?= /tmp/vex-world.raw
 RAWSIZE ?= 320x180
 ZOOM    ?= 200
 
-# SEED pins the world and MAP_VIEW=1 starts in the whole-map overview. Build-time
-# rather than key-driven, so these targets work with no TTY.
+# SEED pins the world. MAP_VIEW=false starts in the scrolling view instead of
+# the overview the cart opens in; unset takes the cart's own default, which is
+# already the overview.
 SEED    ?=
 SEEDS  ?= 0x51ED 0x7A3F 0x2C91 0xFEED 0x1234 0xABCD
 
 # -D flags want decimal; hex reads better for seeds.
 dec = $(shell printf '%d' $(1))
 SEEDOPT  = $(if $(SEED),-Dseed=$(call dec,$(SEED)),)
-VIEWOPT  = $(if $(filter 1,$(MAP_VIEW)),-Dmap_view=true,)
+VIEWOPT  = $(if $(MAP_VIEW),-Dmap_view=$(MAP_VIEW),)
 
 # The console's host import module. src/env.zig stands in for it, and the tests
 # link it back with -lenv.
@@ -102,13 +103,13 @@ png: shot
 
 ## overview: one PNG of the whole map, e.g. `make overview SEED=0x51ED`
 overview:
-	@$(MAKE) --no-print-directory png FRAMES=60 SEED=$(SEED) MAP_VIEW=1
+	@$(MAKE) --no-print-directory png FRAMES=60 SEED=$(SEED)
 
 ## seeds: one overview PNG per seed in SEEDS, for checking generator variety
 seeds:
 	@for s in $(SEEDS); do \
 		echo "== seed $$s"; \
-		$(MAKE) --no-print-directory png FRAMES=60 SEED=$$s MAP_VIEW=1 \
+		$(MAKE) --no-print-directory png FRAMES=60 SEED=$$s \
 			SHOT=/tmp/vex-world-$$s.raw; \
 	done
 

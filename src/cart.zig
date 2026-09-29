@@ -10,7 +10,8 @@ const vex = @import("vex");
 const cfg = @import("cfg");
 
 // -- palette ----------------------------------------------------------------
-// JONK 16, applied over the console's default SWEETIE-16 in boot().
+// The cart's own 16-colour palette, applied over the console's default SWEETIE-16
+// in boot().
 //
 // The art names colours by role rather than by index, so trying another palette
 // means editing this block and the table in boot(), and nothing else. That is
@@ -20,66 +21,78 @@ const cfg = @import("cfg");
 // indices the art hides all of that, and swapping palettes then silently turns
 // grass into steel blue and snow into dark brown -- which is exactly what
 // happened to the first version of this file.
-const JONK16 = [16]u32{
-    0x242e36, 0x455951, 0x798766, 0xb7bca2,
-    0xd6d6d6, 0xf4f0ea, 0x6988a1, 0xa1b0be,
-    0x595b7c, 0x95819d, 0xc9a5a9, 0xf4dec2,
-    0x704f4f, 0xb7635b, 0xe39669, 0xebc790,
+const PALETTE = [16]u32{
+    0x1c242e, 0x1e3328, 0x4a6b40, 0x93a35e,
+    0xc9b183, 0x6e7276, 0x9b9689, 0x4f565c,
+    0xeef1ee, 0x24384c, 0x3d6480, 0x79aec0,
+    0xa8604f, 0x5a3a2c, 0x3a4046, 0xf2d9b8,
 };
 
 /// Index 0 is reserved and never appears in tile art: it is the blit
 /// transparency key for the transition bands, so a terrain pixel painted 0
 /// would punch a hole in the map.
 const C = struct {
-    // water, deepest first. A crest tone is the next depth's body tone, so a
+    // Water, deepest first. A crest tone is the next depth's body tone, so a
     // shoreline ramps continuously instead of stepping.
-    const water_deep: u8 = 8; // #595b7c muted indigo
-    const water: u8 = 6; // #6988a1 steel blue
-    const water_crest: u8 = 7; // #a1b0be pale blue
-    const water_channel: u8 = 9; // #95819d, a lighter deep
-    const water_deepest: u8 = 1; // #455951 dark slate
-    const shoal: u8 = 15; // #ebc790, sand showing through
+    // The four water tones are a strict chain, and nothing else may join it:
+    // body 9 -> crest 10 -> body 10 -> crest 11. The mottle tones have to sit
+    // outside that chain or they land on a crest, and the wave check compares
+    // the crest *pixel set* of the two water tiles -- a mottle in a crest
+    // colour makes the two tiles disagree about where the wave is, which tears
+    // the sea along every DEEP/SHALLOWS seam. 14 is the only spare dark tone.
+    const water_deep: u8 = 9; // #24384c
+    const water: u8 = 10; // #3d6480
+    const water_crest: u8 = 11; // #79aec0
+    const water_channel: u8 = 14; // #3a4046, a lighter deep
+    const water_deepest: u8 = 7; // #4f565c, the darkest: a deep trench
+    // Sand showing through. Must not be the crest tone: SHALLOWS sprinkles this
+    // into its body, and if it equalled SHALLOW_CREST the two water tiles would
+    // disagree about which pixels are wave, which is what the wave check
+    // compares. 4 is the beach tone, so the shoreline still reads continuous.
+    const shoal: u8 = 4; // #c9b183, sand showing through
 
-    const grass: u8 = 2; // #798766 olive
-    const grass_light: u8 = 3; // #b7bca2 pale sage
-    const flower: u8 = 11; // #f4dec2 cream
-    const forest: u8 = 1; // #455951 dark slate green
-    const forest_light: u8 = 2; // #798766 olive, same family as the grass
-    // Deeper in. No new palette entry: the tier is carried by how much canopy
-    // each patch holds, not by a third green. An earlier attempt used the brown
-    // (#704f4f) and read as mud at one pixel per tile -- a different biome, not
-    // a deeper wood. The dither between these two greens is the whole signal.
-    const forest_deep: u8 = 1; // #455951, the same dark green, barely dappled
+    // Vegetation darkens as the canopy closes over. Each tier is its own index
+    // now: the old palette had forest and deep forest on the *same* entry and
+    // carried the tier entirely in dither density, which is invisible at one
+    // pixel per tile -- the two read as one flat green.
+    const grass: u8 = 3; // #93a35e olive
+    const grass_light: u8 = 4; // #c9b183, pale dry grass
+    const flower: u8 = 15; // #f2d9b8 cream
+    const forest: u8 = 2; // #4a6b40 mid green
+    const forest_light: u8 = 3; // #93a35e, the same family as the grass
+    const forest_deep: u8 = 1; // #1e3328, the densest canopy
 
-    const sand: u8 = 15; // #ebc790
-    const sand_dark: u8 = 14; // #e39669
+    const sand: u8 = 4; // #c9b183
+    const sand_dark: u8 = 12; // #a8604f, darker sand
 
-    const rock: u8 = 9; // #95819d dusty purple
-    const rock_light: u8 = 4; // #d6d6d6
-    const rock_dark: u8 = 12; // #704f4f
-    // The two tiers above the first and the peak between them and snow. A ramp
-    // in *value* from the purple up to near-white is what makes the climb
-    // legible, and there are only 16 slots to spend, so the tiers re-mix tones
-    // already in use rather than claiming new ones. An earlier attempt gave the
-    // scree the sand orange (#e39669) and high ground read as beach.
-    const rock_high: u8 = 4; // #d6d6d6 pale stone
-    // Dark, not pale: the top of a range has to be the most visible part
-    // of it, and the scree below already owns the pale end of the ramp.
-    const peak: u8 = 12; // #704f4f dark stone
+    // Stone. The value zigzags on the way up -- grey, then pale talus, then dark
+    // exposed summit rock, then white snow -- because that is what elevation
+    // looks like. What matters is that no two *adjacent* tiers share a
+    // luminance, which is what a monotonic ramp would have given up.
+    const rock: u8 = 5; // #6e7276 cool grey stone
+    const rock_light: u8 = 6; // #9b9689 pale, catches light
+    const rock_dark: u8 = 14; // #3a4046 dark slate
+    const rock_high: u8 = 6; // #9b9689 pale, dusty broken rock
+    // Dark, not pale. Bare summit stone is dark; the white above it is snow.
+    // A pale peak inverted the ramp and contradicted what a mountain looks
+    // like, and the cone shapes need a dark ground to read against.
+    const peak: u8 = 7; // #4f565c exposed summit rock
+    const peak_lit: u8 = 5; // #6e7276, the lit flank of a cone
+    const peak_ground: u8 = 14; // #3a4046, between the cones
 
-    const snow: u8 = 5; // #f4f0ea
-    const snow_shade: u8 = 4; // #d6d6d6
-    const snow_tint: u8 = 7; // #a1b0be
+    const snow: u8 = 8; // #eef1ee
+    const snow_shade: u8 = 6; // #9b9689
+    const snow_tint: u8 = 11; // #79aec0, a cold shadow
 
-    const roof: u8 = 13; // #b7635b terracotta
-    const wall: u8 = 4; // #d6d6d6
-    const timber: u8 = 12; // #704f4f
+    const roof: u8 = 12; // #a8604f weathered terracotta
+    const wall: u8 = 6; // #9b9689 pale plaster
+    const timber: u8 = 13; // #5a3a2c wood brown, for once actually wood
 
-    const ui_bg: u8 = 0; // #242e36
-    const ui_dim: u8 = 1; // #455951
-    const ui_text: u8 = 4; // #d6d6d6
-    const ui_bright: u8 = 5; // #f4f0ea
-    const ui_fill: u8 = 2; // #798766
+    const ui_bg: u8 = 0; // #1c242e
+    const ui_dim: u8 = 2; // #4a6b40
+    const ui_text: u8 = 6; // #9b9689
+    const ui_bright: u8 = 8; // #eef1ee
+    const ui_fill: u8 = 3; // #93a35e
 };
 
 // -- world geometry ---------------------------------------------------------
@@ -749,10 +762,18 @@ var retries: u32 = 0;
 var frame: i32 = 0;
 var cam_x: i32 = 0;
 var cam_y: i32 = 0;
-/// X swaps the scrolling view for the whole world at one pixel per tile.
-/// `zig build -Dmap_view=1` starts there instead, so `make overview` can render
-/// the whole map from the command line with no TTY to press X in.
-var zoomed_out: bool = cfg.map_view;
+/// The whole map at one pixel per tile, which is where the cart opens.
+///
+/// Starting zoomed *in* dropped the player into one arbitrary corner of a
+/// 320x160 world with no idea of what the rest looked like, and the only way
+/// out was to press a key to find the map. Opening on the map inverts it: the
+/// shape of the world is the first thing on screen, and zooming in is a
+/// decision about where to go -- click the tile, or arrows and RMB/X to come
+/// back out.
+///
+/// `zig build -Dmap_view=false` starts in the scrolling view instead, which is
+/// only useful for rendering that view headlessly.
+var zoomed_out: bool = cfg.map_view orelse true;
 /// The mouse API reports held, not just-pressed, so every mouse button needs its
 /// own previous-frame state to find the edge on.
 var mouse_was_down: bool = false;
@@ -1269,7 +1290,7 @@ fn edgeScroll(m: i32, extent: i32) i32 {
 
 export fn boot() void {
     vex.title("vex-world");
-    for (JONK16, 0..) |rgb, i| vex.pal(@intCast(i), @bitCast(rgb));
+    for (PALETTE, 0..) |rgb, i| vex.pal(@intCast(i), @bitCast(rgb));
     _ = reset(seed);
     cam_x = MAX_CAM_X / 2;
     cam_y = MAX_CAM_Y / 2;
@@ -1605,7 +1626,7 @@ test "tile art never uses palette 0, which is the band transparency key" {
 
 test "the palette table is the one the art is drawn against" {
     // 16 entries, and the roles must stay inside it
-    try std.testing.expectEqual(@as(usize, 16), JONK16.len);
+    try std.testing.expectEqual(@as(usize, 16), PALETTE.len);
     inline for (@typeInfo(C).@"struct".decls) |d| {
         const v = @field(C, d.name);
         if (@TypeOf(v) != u8) continue;

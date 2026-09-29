@@ -7,10 +7,9 @@ pub fn build(b: *std.Build) void {
     // a spread of them without editing src/cart.zig between builds. Unset
     // means the cart's own default.
     const seed = b.option(u32, "seed", "Seed for the world to boot into");
-    // -Dmap_view=1 boots straight into the whole-map overview, for `make
-    // overview` / `make seeds`, which render terrain from the command line and
-    // so have no TTY to press X in.
-    const map_view = b.option(bool, "map_view", "Boot into the whole-map overview");
+    // -Dmap_view=false boots into the scrolling view instead of the overview
+    // the cart opens in. Only useful for rendering that view headlessly.
+    const map_view = b.option(bool, "map_view", "Boot into the scrolling view");
 
     // Carts compile to wasm32-freestanding.
     const wasm_target = b.resolveTargetQuery(.{
@@ -53,7 +52,8 @@ pub fn build(b: *std.Build) void {
     // means the cart's own default.
     const cfg = b.addOptions();
     cfg.addOption(?u32, "seed", seed);
-    cfg.addOption(bool, "map_view", map_view orelse false);
+    // Optional, so the cart keeps its own default when the flag is unset.
+    cfg.addOption(?bool, "map_view", map_view);
     // The host test build has no build system to generate this module, so it
     // links src/cfg.zig under the same name instead -- src/cart.zig does not
     // need to know which of the two it got.

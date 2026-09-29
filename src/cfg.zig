@@ -5,4 +5,8 @@
 //! instead, where there is no build system to generate one -- the tests pick
 //! their own seeds anyway. Kept so `zig test` needs no extra flags.
 pub const seed: ?u32 = null;
-pub const map_view: bool = false;
+/// Optional, not a plain bool, so "unset" is distinguishable from "false".
+/// The cart opens on the map, so the fallback for unset is the overview; a
+/// plain `false` here would silently override that to the scrolling view in
+/// every host test build.
+pub const map_view: ?bool = null;
