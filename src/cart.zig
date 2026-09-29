@@ -155,8 +155,11 @@ const ALL_TILES: u16 = (@as(u16, 1) << TILE_COUNT) - 1;
 /// goes as T * sqrt(VARIANTS), so 4 repeats about every 32px and 8 about every
 /// 45px -- enough that grass and sand stop reading as wallpaper.
 ///
-/// Costs 2 KB per variant across art and bands, so this is the knob to turn
-/// back down if the wasm gets too big. It only helps the *noise* tiles: ruins
+/// Costs 11,264 bytes per variant -- art and bands together -- measured by
+/// building at 2, 4, 6 and 8 and taking the slope, so this is the knob to turn
+/// back down if the wasm gets too big. At 8 the tables are 90 KB of a 458 KB
+/// cart. Four is 45 KB smaller and the repeat period above says it still reads,
+/// so 8 is a choice rather than a floor. It only helps the *noise* tiles: ruins
 /// needed a different fix entirely, see tileArt.
 const VARIANTS: usize = 8;
 
@@ -1552,6 +1555,38 @@ test "the same seed always collapses to the same world" {
         while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
         try std.testing.expect(solved);
         if (pass == 0) first = world else try std.testing.expectEqualSlices(u8, &first, &world);
+    }
+}
+
+test "the per-frame collapse budget does not change the world" {
+    // The cart solves GENERATE_PER_FRAME cells at a time so the map can be
+    // watched appearing; a test just calls solve(CELLS) and gets it all at
+    // once. Those have to agree, or no test could say anything about what the
+    // cart actually shows -- and a while back this was believed not to hold,
+    // on the strength of a probe that called solve(CELLS) without resetting
+    // first and so inherited the previous test's half-collapsed world. They
+    // agree exactly. The budget only decides how many iterations a call makes
+    // before returning, and a dead end re-rolls the same way either way.
+    //
+    // Checked across seeds that all settle without a retry as well as ones
+    // that might not, so this is not an artefact of the easy path.
+    for ([_]u32{ 0x51ED, 0x7A3F, 0x2C91, 0xFEED, 0x1234, 0xABCD, 0xC0FFEE, 0, 1, 0xFFFF }) |s| {
+        _ = reset(s);
+        var guard: usize = 0;
+        while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+        try std.testing.expect(solved);
+        var one_shot: [CELLS]u8 = undefined;
+        @memcpy(&one_shot, &world);
+        const one_shot_seed = seed;
+
+        _ = reset(s);
+        guard = 0;
+        while (!solved and guard < 2000) : (guard += 1) _ = solve(GENERATE_PER_FRAME);
+        try std.testing.expect(solved);
+        // A retry lands on a different world entirely, so compare the seed the
+        // solve ended on too, not just the tiles.
+        try std.testing.expectEqual(one_shot_seed, seed);
+        try std.testing.expectEqualSlices(u8, &one_shot, &world);
     }
 }
 

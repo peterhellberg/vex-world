@@ -89,16 +89,21 @@ the cart's own default, `0xC0FFEE`.
 
 ## Tests
 
-`make test` runs 29 checks on the host against `src/env.zig` — the generator obeys its own
+`make test` runs 30 checks on the host against `src/env.zig` — the generator obeys its own
 adjacency table, the same seed always collapses to the same world, seams are blended once and only
 toward the neighbour, every elevation tier gets a visible share of the land, ruins stay off the
 beach, and no tile's map colour is one its art never paints.
 
-## Known rough edges
+## Notes
 
-- A one-shot `solve(CELLS)` in a test does not produce the same world as the cart's incremental
-  `solve(GENERATE_PER_FRAME)`, so coordinates read from a test do not match the rendered map.
-  Locate things in a render, not in a test, until that is pinned down.
-- The full overview's viewport rectangle is still a 1px outline in the same near-white as the rest
-  of the UI, and has not been looked at since the minimap marker was reworked.
-- Tile variants cost 2 KB each in the wasm. `VARIANTS` is the knob to turn down if the cart grows.
+- The cart solves `GENERATE_PER_FRAME` cells at a time so the map can be watched appearing, while a
+  test calls `solve(CELLS)` and gets it in one go. These produce identical worlds, checked across
+  ten seeds: the budget only decides how many iterations a call makes before returning. An earlier
+  version of this file claimed otherwise, on the strength of a probe that called `solve(CELLS)`
+  without resetting first and so inherited the previous test's half-collapsed world. There is now a
+  test for it.
+- `VARIANTS` is the size knob: 11,264 bytes each in the wasm, art and bands together, so the eight
+  of them are 90 KB of a 458 KB cart. Four is 45 KB smaller and still reads.
+- The overview's viewport rectangle needs no treatment beyond the 1px outline it already has. At
+  full-map scale it is 20x10 and has an 18x8 interior to be hollow; the minimap's is 5x2, which has
+  no interior at all and is why that one is grown a pixel.
