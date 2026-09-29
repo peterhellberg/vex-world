@@ -727,12 +727,12 @@ fn wantClass(h: f32) u8 {
     if (h < sea + 0.035) return SAND;
     // how far up the land this cell sits, 0 at the shore and 1 at the peak
     const up = (h - sea - 0.035) / @max(1.0 - sea - 0.035, 0.01);
-    if (up < 0.20) return GRASS;
-    if (up < 0.38) return FOREST;
-    if (up < 0.53) return FOREST_DEEP;
-    if (up < 0.67) return ROCK;
-    if (up < 0.79) return ROCK_HIGH;
-    if (up < 0.90) return PEAK;
+    if (up < 0.13) return GRASS;
+    if (up < 0.27) return FOREST;
+    if (up < 0.39) return FOREST_DEEP;
+    if (up < 0.51) return ROCK;
+    if (up < 0.65) return ROCK_HIGH;
+    if (up < 0.78) return PEAK;
     return SNOW;
 }
 
@@ -1838,4 +1838,50 @@ test "every HUD line fits the screen in the 8x8 font" {
     // And the font assumption itself, so a console font change fails here rather
     // than as a silently clipped line much later.
     try std.testing.expectEqual(@as(i32, 39), cap);
+}
+
+test "every elevation tier gets a visible share of the land" {
+    // The tiers were all reachable and the palette ramp was correct, and the
+    // highlands still read as one flat colour -- because the band edges gave
+    // rock five times the area of peaks, so rock filled the frame and the rest
+    // were thin edges. Reachability is not the same as visibility.
+    //
+    // Measured over six seeds, as a share of the map:
+    //     6.15  rock      3.12  scree    1.11  peaks    0.19  snow
+    // which is a geometric shrink, and a map is mostly a gradient of its
+    // largest term. The edges are now fitted to the height distribution's
+    // quantiles instead, which is what the numbers below assert.
+    const seeds = [_]u32{ 0x51ED, 0x7A3F, 0x2C91, 0xFEED, 0x1234, 0xABCD };
+    var counts: [TILE_COUNT]u32 = @splat(0);
+    var total: u32 = 0;
+    for (seeds) |s| {
+        _ = reset(s);
+        var guard: usize = 0;
+        while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+        for (0..CELLS) |i| {
+            counts[world[i]] += 1;
+            total += 1;
+        }
+    }
+    const n: f32 = @floatFromInt(total);
+    const land = [_]u8{ GRASS, FOREST, FOREST_DEEP, ROCK, ROCK_HIGH, PEAK, SNOW };
+
+    // Water is not part of the gradient, so it is excluded from the floor: a
+    // world can be nearly all ocean and still be fine.
+    for (land) |t| {
+        try std.testing.expect(100.0 * @as(f32, @floatFromInt(counts[t])) / n > 0.8);
+    }
+    // And the ramp must not collapse back to one dominant term. The largest
+    // land tier may not swamp the smallest by more than 12:1. It is currently
+    // 8:1 (forest 11.97% against snow 1.49%) and was 32:1, which is what made
+    // the highlands read as one colour: rock at 6.15% beside peaks at 1.11% and
+    // snow at 0.19%, so the frame was almost entirely rock.
+    var lo: f32 = 1e9;
+    var hi: f32 = 0;
+    for (land) |t| {
+        const s2: f32 = 100.0 * @as(f32, @floatFromInt(counts[t])) / n;
+        lo = @min(lo, s2);
+        hi = @max(hi, s2);
+    }
+    try std.testing.expect(hi / lo < 12.0);
 }
