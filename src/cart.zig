@@ -166,33 +166,35 @@ const Tile = struct {
     art: [VARIANTS][2][T * T]u8 = @splat(@splat(@splat(0))),
 };
 
+/// How rare a ruin is. One in this many settled land cells becomes one, and
+/// rolls that land somewhere a ruin may not sit are discarded, so the real
+/// rate is a little lower. Previously the rarity was expressed as ruins' pick
+/// weight against the plains', which only worked because the two competed for
+/// the same class; 1:2500 gave 34 ruins on a map, all of them on one contour.
+const RUIN_ODDS: usize = 900;
+
 const TILES: [TILE_COUNT]Tile = blk: {
     var list: [TILE_COUNT]Tile = .{
         .{ .kind = .deep, .cls = 0, .weight = 6, .only = 0, .name = "DEEP SEA", .map = C.water_deep },
         .{ .kind = .shallow, .cls = 1, .weight = 6, .only = 0, .name = "SHALLOWS", .map = C.water },
         .{ .kind = .sand, .cls = 2, .weight = 5, .only = 0, .name = "BEACH", .map = C.sand },
-        .{ .kind = .grass, .cls = 3, .weight = 2500, .only = 0, .name = "PLAINS", .map = C.grass },
+        .{ .kind = .grass, .cls = 3, .weight = 100, .only = 0, .name = "PLAINS", .map = C.grass },
         .{ .kind = .forest, .cls = 4, .weight = 8, .only = 0, .name = "FOREST", .map = C.forest },
         .{ .kind = .forest_deep, .cls = 5, .weight = 6, .only = 0, .name = "DEEP FOREST", .map = C.forest_deep },
         .{ .kind = .rock, .cls = 6, .weight = 4, .only = 0, .name = "HIGHLANDS", .map = C.rock },
         .{ .kind = .rock_high, .cls = 7, .weight = 3, .only = 0, .name = "HIGH SCREE", .map = C.rock_high },
         .{ .kind = .peak, .cls = 8, .weight = 2, .only = 0, .name = "PEAKS", .map = C.peak },
         .{ .kind = .snow, .cls = 9, .weight = 2, .only = 0, .name = "SNOWCAP", .map = C.snow },
-        // A landmark: same elevation band as the plains, so it stays in the
-        // settled lowlands instead of speckling the mountains.
+        // A landmark, not a terrain. Its class is 3 and its rarity is
+        // RUIN_ODDS, but neither drives where one goes: pickTile rolls for it
+        // before the class aim ever runs, precisely because aiming a landmark
+        // by elevation is what put every ruin in the world on one contour and
+        // turned them into a line along the coast.
         //
-        // SAND is deliberately *not* in the whitelist. Ruins can only be
-        // picked where wantClass returns the plains class, which is the bottom
-        // fifth of the land range -- a thin ring that follows the coast. With
-        // beach allowed, every ruin in the world landed in that ring and the
-        // result was a line of houses strung along the shoreline, because a
-        // contour band *is* a coastline. Excluding sand forces them a tile
-        // inland, which is where a ruin belongs anyway.
-        //
-        // The rarity is set by the plains' weight rather than ruins': both are
-        // class 3, so they share a pick pool and the odds are ruins:plains.
-        // At 1:100 that was 162 ruins on one map -- enough to read as a
-        // pattern rather than a landmark. 1:400 puts it near a dozen.
+        // SAND is deliberately *not* whitelisted. A ruin on the beach is a
+        // building in the surf, and allowing it made the shoreline the most
+        // likely place in the world to find one. RUINS is, so they still
+        // gather into villages rather than standing alone.
         .{ .kind = .ruins, .cls = 3, .weight = 1, .only = bit(GRASS) | bit(FOREST) | bit(FOREST_DEEP) | bit(RUINS), .name = "RUINS", .map = C.roof },
     };
     for (&list) |*t| for (0..2) |f| for (0..VARIANTS) |v| {
@@ -958,11 +960,37 @@ fn propagate(start: usize) bool {
 /// ruins are both class 3) the weight decides, so ruins stay rare. Picking on
 /// weight alone gives a map of static, not a world.
 fn pickTile(i: usize, mask: u16) u8 {
+    if (wantClass(height[i]) >= GRASS and (mask & bit(RUINS)) != 0 and rnd() % RUIN_ODDS == 0) {
+        return RUINS;
+    }
+    return pickTerrain(i, mask);
+}
+
+/// The class-aimed pick, with ruins rolled separately in pickTile. Split out so
+/// the aim can be checked on its own, without a ruin roll landing on top of it.
+fn pickTerrain(i: usize, mask: u16) u8 {
     const want = wantClass(height[i]);
+
+    // Ruins are a landmark, not a terrain, and are not chosen by elevation at
+    // all. They used to be picked by the class rule below, which meant they
+    // could only ever win where the field wanted their class -- and a wanted
+    // class is a contour, so every ruin in the world landed on the same
+    // contour. The result was a line of houses following the coastline or the
+    // treeline, which reads as a pattern rather than as ruins.
+    //
+    // So they are rolled for separately, at a fixed rate over settled land.
+    // The `only` whitelist still decides where one may actually sit, so a roll
+    // that lands on a mountain or in the sea is simply not legal here and is
+    // skipped -- the test below leans on that.
     var best_d: u8 = 255;
     var pool: u16 = 0;
     for (0..TILE_COUNT) |t| {
         if (mask & (@as(u16, 1) << @intCast(t)) == 0) continue;
+        // Ruins are skipped here and rolled for in pickTile instead. Leaving
+        // them in the pool put them back on the class-3 contour by weight, which
+        // is the line of houses this whole change exists to remove -- and it did
+        // so no matter what RUIN_ODDS said, because this path ignored it.
+        if (t == RUINS) continue;
         const d = @abs(@as(i32, TILES[t].cls) - @as(i32, want));
         if (d < best_d) {
             best_d = @intCast(d);
@@ -1483,8 +1511,18 @@ test "propagation only ever removes options, never adds them" {
 test "the picked tile is allowed and as close to the aim as possible" {
     _ = reset(0x99);
     for (0..CELLS) |i| {
-        // an unrestricted cell: the aim alone decides the class
-        try std.testing.expectEqual(TILES[pickTile(i, ALL_TILES)].cls, wantClass(height[i]));
+        // An unrestricted cell: the aim alone decides the class -- except where
+        // the ruin roll fires, which is a deliberate exception rather than the
+        // class rule. Ruins carry cls 3 and are exempt from the aim because a
+        // wanted class is a contour, so aiming them put every ruin in the
+        // world on the same one. Masked off here so this check stays about the
+        // terrain aim, and the ruin behaviour is checked on its own below.
+        const t_free = if (wantClass(height[i]) >= GRASS and rnd() % RUIN_ODDS == 0)
+            RUINS
+        else
+            pickTerrain(i, ALL_TILES);
+        if (t_free == RUINS) continue;
+        try std.testing.expectEqual(TILES[t_free].cls, wantClass(height[i]));
 
         // a real cell: the pick must come out of the options propagation left
         const m = masks[i];
@@ -2144,4 +2182,59 @@ test "the panel overlaps the right scroll margin, so suppressing it is not point
     zoomed_out = true;
     try std.testing.expect(!overMinimap(MINIMAP_X, MINIMAP_Y));
     zoomed_out = false;
+}
+
+test "ruins are rare, spread across the land, and never on the beach" {
+    // Three separate bugs, all of which looked like "there are too many ruins".
+    //
+    // Aiming ruins by elevation put every one of them on the same contour, so
+    // 34 on a map read as a line of houses along the treeline rather than as
+    // ruins. A wanted class is a contour, and a landmark is not a terrain, so
+    // the aim must not apply to it.
+    //
+    // Removing them from the aim is only half of it: they also have to leave
+    // the pick pool, or the class rule still reaches them by weight and the
+    // contour comes straight back -- which is exactly what happened, and it
+    // looked like RUIN_ODDS was being ignored, because that path never read it.
+    //
+    // And a ruin on the beach is a building in the surf. SAND is not whitelisted.
+    const seeds = [_]u32{ 0x51ED, 0x7A3F, 0x2C91, 0xFEED, 0x1234, 0xABCD };
+    var ruins: u32 = 0;
+    var per_map: u32 = 0;
+    var want_hist: [TILE_COUNT]u32 = @splat(0);
+    var on_sand: u32 = 0;
+    for (seeds) |s| {
+        _ = reset(s);
+        var guard: usize = 0;
+        while (!solved and guard < 200) : (guard += 1) _ = solve(CELLS);
+        try std.testing.expect(solved);
+        per_map = 0;
+        for (0..CELLS) |i| {
+            if (world[i] != RUINS) continue;
+            per_map += 1;
+            ruins += 1;
+            want_hist[wantClass(height[i])] += 1;
+            const x = i % MAP_W;
+            const y = i / MAP_W;
+            if (x + 1 < MAP_W and world[i + 1] == SAND) on_sand += 1;
+            if (x > 0 and world[i - 1] == SAND) on_sand += 1;
+            if (y + 1 < MAP_H and world[i + MAP_W] == SAND) on_sand += 1;
+            if (y > 0 and world[i - MAP_W] == SAND) on_sand += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(u32, 0), on_sand);
+
+    // Rare: a landmark you trip over. Measured 10 per map at 1:900; 34 was the
+    // old contour line, and anything past about 25 reads as wallpaper.
+    try std.testing.expect(per_map <= 25);
+    try std.testing.expect(per_map > 0); // and not so rare the cart looks broken
+
+    // Spread. If every ruin wanted the same class, they are back on a contour,
+    // and no amount of tuning the rate would show it -- which is why this is
+    // checked as a distribution rather than as a count.
+    var classes_used: usize = 0;
+    for (want_hist) |c| {
+        if (c > 0) classes_used += 1;
+    }
+    try std.testing.expect(classes_used >= 3);
 }
