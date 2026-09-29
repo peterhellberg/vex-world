@@ -72,7 +72,7 @@ const C = struct {
     const rock: u8 = 5; // #6e7276 cool grey stone
     const rock_light: u8 = 6; // #9b9689 pale, catches light
     const rock_dark: u8 = 14; // #3a4046 dark slate
-    const rock_high: u8 = 6; // #9b9689 pale, dusty broken rock
+    const barrens: u8 = 6; // #9b9689 pale, wind-scoured stone
     // Dark, not pale. Bare summit stone is dark; the white above it is snow.
     // A pale peak inverted the ramp and contradicted what a mountain looks
     // like, and the cone shapes need a dark ground to read against.
@@ -117,7 +117,7 @@ const GENERATE_PER_FRAME: usize = @max(64, CELLS / 32);
 
 // -- tiles ------------------------------------------------------------------
 
-const Kind = enum(u8) { deep, shallow, sand, grass, forest, forest_deep, rock, rock_high, peak, snow, ruins };
+const Kind = enum(u8) { deep, shallow, sand, grass, forest, forest_deep, rock, barrens, peak, snow, ruins };
 
 const DEEP: u8 = 0;
 const SHALLOW: u8 = 1;
@@ -130,7 +130,7 @@ const FOREST_DEEP: u8 = 5;
 /// Rock is split three ways, low to high, for the same reason: at one level
 /// the highlands were a single flat purple that gave no sense of rising.
 const ROCK: u8 = 6;
-const ROCK_HIGH: u8 = 7;
+const BARRENS: u8 = 7;
 const PEAK: u8 = 8;
 const SNOW: u8 = 9;
 const RUINS: u8 = 10;
@@ -182,7 +182,7 @@ const TILES: [TILE_COUNT]Tile = blk: {
         .{ .kind = .forest, .cls = 4, .weight = 8, .only = 0, .name = "FOREST", .map = C.forest },
         .{ .kind = .forest_deep, .cls = 5, .weight = 6, .only = 0, .name = "DEEP FOREST", .map = C.forest_deep },
         .{ .kind = .rock, .cls = 6, .weight = 4, .only = 0, .name = "HIGHLANDS", .map = C.rock },
-        .{ .kind = .rock_high, .cls = 7, .weight = 3, .only = 0, .name = "HIGH SCREE", .map = C.rock_high },
+        .{ .kind = .barrens, .cls = 7, .weight = 3, .only = 0, .name = "BARRENS", .map = C.barrens },
         .{ .kind = .peak, .cls = 8, .weight = 2, .only = 0, .name = "PEAKS", .map = C.peak },
         .{ .kind = .snow, .cls = 9, .weight = 2, .only = 0, .name = "SNOWCAP", .map = C.snow },
         // A landmark, not a terrain. Its class is 3 and its rarity is
@@ -453,10 +453,14 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
             },
             // Two rock tiers from one speckle, so the climb reads as one
             // material getting paler rather than two unrelated textures.
-            .rock, .rock_high => {
+            .rock, .barrens => {
                 c = if (n % 13 == 0) C.rock_light else if (n % 19 == 0) C.rock_dark else C.rock;
-                // paler, and the dark fissures thin out
-                if (kind == .rock_high) c = if (n % 11 == 0) C.rock else C.rock_high;
+                // Barrens: paler, with the dark fissures thinning out. Named for
+                // bare wind-scoured ground above the treeline, which is what this
+                // draws. It was "HIGH SCREE", but scree is loose rock piled at
+                // the *foot* of a cliff -- it belongs below the highlands, not
+                // between them and the summits, which is where this tier sits.
+                if (kind == .barrens) c = if (n % 11 == 0) C.rock else C.barrens;
             },
             // Peaks are drawn, not speckled. Everything else in the set is
             // noise at three scales, and a mountain made of noise is just a
@@ -746,7 +750,7 @@ fn wantClass(h: f32) u8 {
     if (up < 0.27) return FOREST;
     if (up < 0.39) return FOREST_DEEP;
     if (up < 0.51) return ROCK;
-    if (up < 0.65) return ROCK_HIGH;
+    if (up < 0.65) return BARRENS;
     if (up < 0.78) return PEAK;
     return SNOW;
 }
@@ -2081,7 +2085,7 @@ test "every elevation tier gets a visible share of the land" {
         }
     }
     const n: f32 = @floatFromInt(total);
-    const land = [_]u8{ GRASS, FOREST, FOREST_DEEP, ROCK, ROCK_HIGH, PEAK, SNOW };
+    const land = [_]u8{ GRASS, FOREST, FOREST_DEEP, ROCK, BARRENS, PEAK, SNOW };
 
     // Water is not part of the gradient, so it is excluded from the floor: a
     // world can be nearly all ocean and still be fine.
