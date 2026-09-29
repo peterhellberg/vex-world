@@ -1134,9 +1134,7 @@ fn draw() void {
     // Not over the minimap: the panel is drawn after this, so an outline here
     // would be painted over anyway, and the HUD would name a tile the player is
     // looking at the *map* of rather than standing on.
-    const over_panel = !zoomed_out and mx >= MINIMAP_X - 1 and mx < MINIMAP_X + MINIMAP_W + 1 and
-        my >= MINIMAP_Y - 1 and my < MINIMAP_Y + MINIMAP_H + 1;
-    if (my < HUD_Y and !over_panel and vex.mdown(vex.MOUSE_LEFT)) {
+    if (my < HUD_Y and !overMinimap(mx, my) and vex.mdown(vex.MOUSE_LEFT)) {
         vex.rectb(hx * t_i - cam_x - 1, hy * t_i - cam_y - 1, t_i + 2, t_i + 2, C.ui_bright);
         vex.rectb(hx * t_i - cam_x, hy * t_i - cam_y, t_i, t_i, TILES[hover].map);
     }
@@ -1191,16 +1189,36 @@ const HINT_MAP = "CLICK MOVE BOX   X/RMB WORLD";
 const CHAR_W: i32 = 8;
 const HUD_MARGIN: i32 = 4;
 
-/// Map tile under a click in the 1:1 overview, or null if the click landed off
-/// the map -- on the frame, or on the HUD. Null matters: a click just past the
-/// edge would otherwise recentre on a tile far off the island, and the camera
-/// would jump somewhere the player never pointed at.
-fn overviewTileAt(mx: i32, my: i32) ?struct { x: i32, y: i32 } {
-    const x = mx - MAP_X;
-    const y = my - MAP_Y;
-    if (x < 0 or y < 0) return null;
-    if (x >= @as(i32, @intCast(MAP_W)) or y >= @as(i32, @intCast(MAP_H))) return null;
-    return .{ .x = x, .y = y };
+/// A map tile in map-cell coordinates, as a click resolves to one.
+const TileAt = struct { x: i32, y: i32 };
+
+/// Map tile under a click on a map drawn at `ox`,`oy` in `w`x`h` pixels, or
+/// null if the click landed off it. Null matters: a click just past the edge
+/// would otherwise recentre on a tile far off the island, and the camera would
+/// jump somewhere the player never pointed at.
+fn mapTileAt(mx: i32, my: i32, ox: i32, oy: i32, w: i32, h: i32) ?TileAt {
+    const x = mx - ox;
+    const y = my - oy;
+    if (x < 0 or y < 0 or x >= w or y >= h) return null;
+    // Stretched so the map's first column is the panel's first and its last is
+    // the panel's last, rather than by a fixed per-pixel bias.
+    //
+    // At 4x4 every fixed bias strands an edge: mapping to the first covered
+    // cell puts the last panel pixel on 316 rather than 319, so the far corner
+    // of the map cannot be clicked at all; the last covered cell strands the
+    // left edge instead; the centre lands on 2 and 318 and strands both.
+    // Spreading the map across the panel reaches every cell, and at 1:1 -- w ==
+    // MAP_W, which is what the full-screen overview uses -- it collapses to the
+    // identity, so one expression is exact in both views.
+    return .{
+        .x = @divTrunc(x * (@as(i32, @intCast(MAP_W)) - 1), w - 1),
+        .y = @divTrunc(y * (@as(i32, @intCast(MAP_H)) - 1), h - 1),
+    };
+}
+
+/// The full-screen overview's placement, which is the map drawn 1:1.
+fn overviewTileAt(mx: i32, my: i32) ?TileAt {
+    return mapTileAt(mx, my, MAP_X, MAP_Y, @intCast(MAP_W), @intCast(MAP_H));
 }
 
 fn input() void {
@@ -1231,7 +1249,10 @@ fn input() void {
     // included: measuring against the map area instead leaves the bottom strip
     // dead, and the lowest place you can scroll from is then the last map row
     // rather than the bottom of the screen, which reads as being off by one.
-    if (edgeScrollAllowed(zoomed_out, held, mouseOnScreen())) {
+    // The panel sits in the top-right corner, which is inside the right-hand
+    // scroll margin, so without this a press on it would both recentre *and*
+    // scroll on the same gesture. The panel wins: a click there is a click.
+    if (edgeScrollAllowed(zoomed_out, held, mouseOnScreen() and !overMinimap(vex.mx(), vex.my()))) {
         cam_x += edgeScroll(vex.mx(), vex.WIDTH);
         cam_y += edgeScroll(vex.my(), vex.HEIGHT);
     }
@@ -1241,13 +1262,15 @@ fn input() void {
     // direction you want. The mouse API has no "just pressed", only held, so the
     // edge is detected above.
     //
-    // Only the full-screen overview, and deliberately not the small panel over
-    // the world view. The panel is a readout: you are standing somewhere in
-    // detail, and a click on the map behind you should not teleport you. The
-    // panel is drawn over that terrain, so the click has to pass through to the
-    // tile under it rather than being swallowed.
-    if (zoomed_out and clicked and mouseOnScreen()) {
-        if (overviewTileAt(vex.mx(), vex.my())) |tile| {
+    // Whichever map is on screen: the full overview, or the small panel over
+    // the world view. Edge scrolling is suppressed over the panel separately,
+    // so a press there is only ever this.
+    if (clicked and mouseOnScreen()) {
+        const t = if (zoomed_out)
+            overviewTileAt(vex.mx(), vex.my())
+        else
+            mapTileAt(vex.mx(), vex.my(), MINIMAP_X, MINIMAP_Y, MINIMAP_W, MINIMAP_H);
+        if (t) |tile| {
             const ti: i32 = @intCast(T);
             cam_x = (tile.x - @divTrunc(VIEW_W, 2)) * ti;
             cam_y = (tile.y - @divTrunc(VIEW_H, 2)) * ti;
@@ -1302,6 +1325,17 @@ const MINIMAP_W: i32 = 80;
 const MINIMAP_H: i32 = 40;
 const MINIMAP_X: i32 = vex.WIDTH - MINIMAP_W - 4;
 const MINIMAP_Y: i32 = 4;
+
+/// Is the pointer over the small panel, frame included? One definition because
+/// three separate things have to agree on where it is: the click that recentres,
+/// the edge scroll that must *not* fire while the pointer is there, and the
+/// hover outline that must not name a tile hidden behind the panel. The panel
+/// only exists in the world view; in the overview it is not drawn.
+fn overMinimap(mx: i32, my: i32) bool {
+    return !zoomed_out and
+        mx >= MINIMAP_X - 1 and mx < MINIMAP_X + MINIMAP_W + 1 and
+        my >= MINIMAP_Y - 1 and my < MINIMAP_Y + MINIMAP_H + 1;
+}
 
 /// Whether the mouse should move the camera this frame. Split out from input()
 /// so the rule is one named thing rather than a condition buried in a block of
@@ -1981,4 +2015,69 @@ test "the small minimap sits on screen and clear of the HUD" {
     // map area is HUD_Y tall -- the map occupies everything above the strip, so
     // HEIGHT - HUD_Y is the strip, not the map.
     try std.testing.expect(MINIMAP_W * MINIMAP_H < vex.WIDTH * HUD_Y / 10);
+}
+
+test "the small minimap resolves a click to the tile under it" {
+    // The panel is 4x4 down from the map, so a click resolves by stretching
+    // rather than by offsetting, and the corners are the whole test: each panel
+    // pixel covers four map cells, so a naive mapping leaves the far corner of
+    // the map unreachable.
+    const at = struct {
+        fn f(x: i32, y: i32) TileAt {
+            return mapTileAt(MINIMAP_X + x, MINIMAP_Y + y, MINIMAP_X, MINIMAP_Y, MINIMAP_W, MINIMAP_H).?;
+        }
+    }.f;
+    const tl = at(0, 0);
+    try std.testing.expectEqual(@as(i32, 0), tl.x);
+    try std.testing.expectEqual(@as(i32, 0), tl.y);
+    const br = at(MINIMAP_W - 1, MINIMAP_H - 1);
+    try std.testing.expectEqual(@as(i32, @intCast(MAP_W)) - 1, br.x);
+    try std.testing.expectEqual(@as(i32, @intCast(MAP_H)) - 1, br.y);
+
+    // Off the panel, including the frame's own pixel.
+    try std.testing.expect(mapTileAt(MINIMAP_X - 1, MINIMAP_Y, MINIMAP_X, MINIMAP_Y, MINIMAP_W, MINIMAP_H) == null);
+    try std.testing.expect(mapTileAt(MINIMAP_X + MINIMAP_W, MINIMAP_Y, MINIMAP_X, MINIMAP_Y, MINIMAP_W, MINIMAP_H) == null);
+
+    // Every click must land inside the map, not just the corners.
+    for (0..MINIMAP_H) |my| {
+        for (0..MINIMAP_W) |mx| {
+            const t = mapTileAt(
+                MINIMAP_X + @as(i32, @intCast(mx)),
+                MINIMAP_Y + @as(i32, @intCast(my)),
+                MINIMAP_X,
+                MINIMAP_Y,
+                MINIMAP_W,
+                MINIMAP_H,
+            ) orelse return error.MinimapPixelMissed;
+            if (t.x < 0 or t.y < 0 or t.x >= @as(i32, @intCast(MAP_W)) or t.y >= @as(i32, @intCast(MAP_H)))
+                return error.MinimapClickOutOfRange;
+        }
+    }
+}
+test "the panel overlaps the right scroll margin, so suppressing it is not pointless" {
+    // The panel sits in the top-right corner. Edge scrolling is suppressed over
+    // it, and that only matters if the panel is actually inside the scroll
+    // margin -- otherwise the suppression guards nothing and the corner is just
+    // a panel.
+    //
+    // This is deliberately a property of the constants rather than a replay of
+    // the expression in input(). An earlier version of this check rebuilt
+    // `held and on_screen and not on_panel` inline, which passed with the
+    // suppression deleted from the call site -- it was testing its own copy.
+    try std.testing.expect(MINIMAP_X + MINIMAP_W > vex.WIDTH - 1 - EDGE);
+
+    // overMinimap is the geometry, and that is testable: the frame counts as
+    // part of the panel, and the panel is not there at all in the overview.
+    //
+    // zoomed_out is global and an earlier test leaves it wherever it liked, so
+    // it is pinned here rather than assumed.
+    zoomed_out = false;
+    try std.testing.expect(overMinimap(MINIMAP_X, MINIMAP_Y));
+    try std.testing.expect(overMinimap(MINIMAP_X - 1, MINIMAP_Y - 1)); // frame
+    try std.testing.expect(!overMinimap(MINIMAP_X - 2, MINIMAP_Y));
+    try std.testing.expect(!overMinimap(MINIMAP_X + MINIMAP_W + 1, MINIMAP_Y)); // frame
+    try std.testing.expect(!overMinimap(MINIMAP_X, MINIMAP_Y + MINIMAP_H + 1));
+    zoomed_out = true;
+    try std.testing.expect(!overMinimap(MINIMAP_X, MINIMAP_Y));
+    zoomed_out = false;
 }
