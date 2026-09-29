@@ -1,0 +1,8 @@
+/zig-out/
+/zig-pkg/
+/.zig-cache/
+/bundle/
+
+# built by `make test` so the checks can link against the console's `env`
+# imports off-cart
+/libenv.so
