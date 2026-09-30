@@ -144,7 +144,7 @@ const GENERATE_PER_FRAME: usize = @max(64, CELLS / 16);
 
 // -- tiles ------------------------------------------------------------------
 
-const Kind = enum(u8) { deep, shallow, sand, grass, forest, forest_deep, rock, barrens, peak, snow, ruins };
+const Kind = enum(u8) { deep, shallow, sand, grass, forest, forest_deep, rock, barrens, peak, snow, ruins, river };
 
 const DEEP: u8 = 0;
 const SHALLOW: u8 = 1;
@@ -161,7 +161,11 @@ const BARRENS: u8 = 7;
 const PEAK: u8 = 8;
 const SNOW: u8 = 9;
 const RUINS: u8 = 10;
-const TILE_COUNT: usize = 11;
+/// A river channel, which is the one water tile that is not part of the sea's
+/// depth ramp. It carries no class of its own: its whole point is the `only`
+/// whitelist, which lets it touch terrain that no other water tile may.
+const RIVER: u8 = 11;
+const TILE_COUNT: usize = 12;
 const ALL_TILES: u16 = (@as(u16, 1) << TILE_COUNT) - 1;
 
 /// How many looks each tile kind gets, chosen per map position at draw time so
@@ -225,7 +229,26 @@ const TILES: [TILE_COUNT]Tile = blk: {
         // building in the surf, and allowing it made the shoreline the most
         // likely place in the world to find one. RUINS is, so they still
         // gather into villages rather than standing alone.
-        .{ .kind = .ruins, .cls = 3, .weight = 1, .only = bit(GRASS) | bit(FOREST) | bit(FOREST_DEEP) | bit(RUINS), .name = "RUINS", .map = C.roof },
+        .{ .kind = .ruins, .cls = 3, .weight = 1, .only = bit(GRASS) | bit(FOREST) | bit(FOREST_DEEP) | bit(RUINS) | bit(RIVER), .name = "RUINS", .map = C.roof },
+        // A channel, not a depth. `cls` is 1 only so the class arithmetic has
+        // something to say; what actually governs it is `only`, which is every
+        // tile in the game. Water may otherwise only touch sand, and sand only
+        // grass, so a river drawn out of the shallows had to keep a clear
+        // two-tile margin of lowland on both banks to stay legal -- and forest
+        // abuts the plains almost everywhere, so no river could reach the sea.
+        // Measured: 38 candidate lakes a map, 0 drainable, on all seven seeds.
+        // A whitelist is how ruins gets to stand in a forest at all, and it is
+        // the right tool here too. One tile wide, no bank, any terrain.
+        .{
+            .kind = .river,
+            .cls = 1,
+            .weight = 1,
+            .only = bit(DEEP) | bit(SHALLOW) | bit(SAND) | bit(GRASS) | bit(FOREST) |
+                bit(FOREST_DEEP) | bit(ROCK) | bit(BARRENS) | bit(PEAK) | bit(SNOW) |
+                bit(RUINS) | bit(RIVER),
+            .name = "RIVER",
+            .map = C.water,
+        },
     };
     for (&list) |*t| for (0..2) |f| for (0..VARIANTS) |v| {
         t.art[v][f] = tileArt(t.kind, f, v);
@@ -308,6 +331,18 @@ fn hash(x: u32, y: u32, s: u32) u32 {
 }
 
 /// Spacing of the wave crests, in the `x + y` sum. It must divide T: draw()
+/// Which of a tile's two art frames to draw.
+///
+/// Only water moves; land holds frame 0 and its alternate is never shown. A
+/// river is water and has to be in here: the test used to be `t <= SHALLOW`, and
+/// RIVER is tile 11, so a channel sat perfectly still while the sea it ran into
+/// rippled around it -- the most obvious way to tell it was not water. It also
+/// needs the `tileArt` crest, since `phase` drives nothing else.
+fn animPhase(t: u8, tx: i32, ty: i32, f: i32) usize {
+    if (t > SHALLOW and t != RIVER) return 0;
+    return @intCast(@as(u32, @bitCast(tx + ty + (f >> 4))) & 1);
+}
+
 /// animates the sea by folding the tile's map position into `phase`, so the
 /// tile term only cancels when the period is a factor of the tile size. With a
 /// period that does not divide T every tile's wave is shifted by a different
@@ -449,6 +484,27 @@ fn dirSlot(d: usize) usize {
     return i;
 }
 
+/// The river's bands on the two sides `BAND_DIRS` does not cover, so a bank can
+/// fade *into* a channel that happens to be earlier in row-major order and so
+/// owns the seam. A separate table rather than widening BANDS to four
+/// directions, because only RIVER is ever needed on those two sides and the
+/// full table would have cost 49 KB of map-adjacent memory for nothing.
+/// North and west: the two sides `BAND_DIRS` never covers.
+const RIVER_SIDES = [_]struct { d: usize, slot: usize }{
+    .{ .d = 0, .slot = 0 },
+    .{ .d = 3, .slot = 1 },
+};
+
+const RIVER_BANDS: [2][VARIANTS][NP]u8 = blk: {
+    @setEvalBranchQuota(64 * VARIANTS);
+    var out: [2][VARIANTS][NP]u8 = @splat(@splat(@splat(0)));
+    for (0..VARIANTS) |v| {
+        out[0][v] = bandArt(RIVER, 0, v); // north edge
+        out[1][v] = bandArt(RIVER, 3, v); // west edge
+    }
+    break :blk out;
+};
+
 const BANDS: [TILE_COUNT][BAND_DIRS.len][VARIANTS][NP]u8 = blk: {
     var out: [TILE_COUNT][BAND_DIRS.len][VARIANTS][NP]u8 = undefined;
     for (0..TILE_COUNT) |b| for (BAND_DIRS, 0..) |d, di| for (0..VARIANTS) |v| {
@@ -484,7 +540,11 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
             // steps from SHALLOWS 9, and read as a void with lines drawn on it.
             // The mottle is what stops either of them looking like a solid fill.
             .deep => c = if (d % 11 == 0) C.water_channel else if (d % 37 == 0) C.water_deepest else DEEP_BODY,
-            .shallow => c = if (d % 11 == 0) DEEP_BODY else if (d % 29 == 0) C.shoal else SHALLOW_BODY,
+            // The river borrows the shallows' bitmap outright. It is the same
+            // water at the same scale, and reusing the art means the wave check,
+            // the shore blend and the palette-role test all treat it as what it
+            // is without a second texture to keep in step.
+            .shallow, .river => c = if (d % 11 == 0) DEEP_BODY else if (d % 29 == 0) C.shoal else SHALLOW_BODY,
             .sand => c = if (n % 17 == 0) C.sand_dark else if (n % 11 == 0) C.flower else C.sand,
             .grass => c = if (n % 53 == 0) C.flower else if (n % 19 == 0) C.grass_light else C.grass,
             // Forest is dither, not drawn crowns. An earlier version painted
@@ -622,7 +682,15 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
         // a DEEP/SHALLOWS seam read as one body of water. DEEP_CREST is exactly
         // SHALLOW's body tone, so the ramp is continuous across the join: 9
         // deep body, 10 deep crest / shallow body, 11 shallow crest.
-        if (kind == .deep or kind == .shallow) {
+        //
+        // RIVER is in here for the same reason the other two are: `phase` only
+        // drives the crest, so a tile left out of this has two byte-identical
+        // frames and sits perfectly still. A channel that does not move while
+        // the sea around it ripples is the most obvious way to tell it is not
+        // water. It takes SHALLOW_CREST because it is shallow water, and it
+        // takes the same `w` noise -- deliberately unseeded by kind -- so a
+        // river meeting the sea breaks its crest along the same lines.
+        if (kind == .deep or kind == .shallow or kind == .river) {
             if (crest(xx, yy, phase) and w % 2 == 0) {
                 c = if (kind == .deep) DEEP_CREST else SHALLOW_CREST;
             }
@@ -769,6 +837,8 @@ fn buildHeight(salt: u32) void {
     // The tallest cell still normalises to exactly 1.0, because the peak is
     // read back out of the same quantised units the field is stored in.
     peak_q = peak;
+    // Carving needs the normaliser, so it can only run once the peak is stored.
+    carveFeatures(salt);
 }
 
 /// How much to sink the field near the edges, 0 in the middle and past 1 in the
@@ -1144,18 +1214,36 @@ fn reset(s: u32) u32 {
     seed = s;
     rng = s | 1;
     height_salt = s;
-    buildHeight(s);
-    // 0.34..0.52: some worlds are mostly archipelago, some mostly continent
+    // 0.20..0.38: some worlds are mostly archipelago, some mostly continent.
+    // Before buildHeight, not after: the carving inside it works in offsets
+    // above sea level, so it has to know which sea level it is carving against.
+    // Called second it silently used the *previous* world's, and since reset
+    // re-seeds the rng the value it eventually picks is the same both times --
+    // so the first world after any other was carved to a different shoreline
+    // than every world after it, and the determinism tests caught it.
     sea = 0.20 + @as(f32, @floatFromInt(rnd() % 19)) * 0.01;
+    buildHeight(s);
     for (&masks) |*m| m.* = ALL_TILES;
+    // The channel is pinned rather than aimed at. `wantClass` works from
+    // height and has no way to say "river", and it should not have one: a
+    // height is a place, not a feature. Starting these cells with RIVER as
+    // their only option is enough, because propagation only ever removes
+    // options -- so a cell that begins as river can only ever end as river, and
+    // what it propagates outward is RIVER's whitelist.
+    for (river_cells[0..river_count]) |c| masks[c] = bit(RIVER);
     // A contradiction returns out of the middle of a propagation, so whatever
     // was still on the stack is left flagged. Nothing has ever hit that path,
     // which is why it went unnoticed; clearing here makes the re-roll start
     // from a clean slate instead of from cells that think they are queued.
     for (&queued) |*q| q.* = false;
-    // Every cell starts wide open, so start them all in the widest list.
+    // Every cell starts wide open, so start them all in the widest list --
+    // except the pinned channel, which has one option and is already decided,
+    // and must not be on an entropy list at all.
     bucketsClear();
-    for (0..CELLS) |i| bucketLink(i, MAX_ENTROPY);
+    for (0..CELLS) |i| {
+        const n = @popCount(masks[i]);
+        if (n > 1) bucketLink(i, n);
+    }
     // No sea ring. One used to frame the map as an island, but pinning the
     // border to open sea fights the field: the terrain wants land right up to
     // the edge, and |cls delta| <= 1 only lets the class climb one step per
@@ -1187,6 +1275,429 @@ fn solve(budget: usize) u32 {
         }
     }
     return 0;
+}
+
+// -- lakes and rivers -------------------------------------------------------
+
+/// Lakes and rivers are carved after the peak is known, because they are
+/// expressed in normalised heights and need the same normaliser the field was
+/// stored with. Carving works in the quantised domain, so it costs no
+/// temporary float array: there is a stored value for any height, and that is
+/// all this needs.
+///
+/// The constraint that shapes all of it is the adjacency rule. `adjacent`
+/// allows a class difference of at most one, water is class 0 or 1, and the
+/// lowest land is grass at 3. So water may only touch sand, and sand may only
+/// touch grass: there is no legal path from water to forest. An inland lake in
+/// the middle of trees is therefore not something this generator can express.
+/// It would need a sand ring *and* a grass ring, flattening a crater's worth of
+/// terrain around every puddle, and the bands would read as quarrying rather
+/// than as water.
+///
+/// So both features live in the lowlands, which is also where breaking up an
+/// island wants them: the middle of a landmass is grass, and grass is exactly
+/// what the rules permit.
+const LAKE_TARGETS: usize = 38;
+/// One per lake, so every lake on the map drains. Capped only by the lake count
+/// now -- the earlier cap of 14 left maps with 21 lakes and 14 rivers, which is
+/// the arbitrary-looking half of the arrangement.
+const RIVER_TARGETS: usize = LAKE_TARGETS;
+const LAKE_R_MIN: i32 = 2;
+const LAKE_R_MAX: i32 = 5;
+/// Water and bank heights, as offsets above `sea`. Both sit inside a band that
+/// already exists on purpose: 0.006 is the shallow band and 0.024 is the sand
+/// band, so a carved lake is made of the same tiles the coast is rather than of
+/// a new kind that has to be kept adjacent to everything.
+const LAKE_H: f32 = 0.006;
+const BANK_H: f32 = 0.024;
+
+var lake_xy: [LAKE_TARGETS]u32 = undefined;
+var lake_r: [LAKE_TARGETS]u8 = undefined;
+var lakes_placed: usize = 0;
+/// The cells the carver turned into channel, which `reset` pins to the RIVER
+/// tile. A list rather than a per-cell flag because it is a few hundred cells
+/// and a flag would be 50 KB of map state to save 2 KB.
+const RIVER_CELL_MAX: usize = RIVER_TARGETS * 64;
+var river_cells: [RIVER_CELL_MAX]u16 = undefined;
+var river_count: usize = 0;
+var rivers_made: usize = 0;
+
+/// A private stream for the carver, so that how many features land does not
+/// shift the solver's own sequence of rolls. Otherwise adding one lake would
+/// change every tile the collapse picks, for reasons that have nothing to do
+/// with the lake.
+fn carverRand(st: *u32) u32 {
+    st.* ^= st.* << 13;
+    st.* ^= st.* >> 17;
+    st.* ^= st.* << 5;
+    return st.*;
+}
+
+/// The stored value that reads back as normalised height `h`.
+fn qFor(h: f32) u16 {
+    const pk = @as(f32, @floatFromInt(peak_q)) / H_SCALE + H_LO;
+    return @intFromFloat(std.math.clamp(((h * pk) - H_LO) * H_SCALE, 0, 65535));
+}
+
+/// Carve down to `h`, never up. Raising would invent land, and a lake that
+/// built a mound around itself would be worse than no lake.
+fn lowerTo(i: usize, h: f32) void {
+    const q = qFor(h);
+    if (q < hq[i]) {
+        hq[i] = q;
+        carved_cells += 1;
+    }
+}
+
+/// How many cells the carver actually lowered. Counted because "inland water"
+/// is not a measure of this: the noise already throws up enclosed basins of its
+/// own, one seed has a lagoon covering 11% of the map, and that has nothing to
+/// do with lakes or rivers.
+var carved_cells: usize = 0;
+
+/// Is this disc entirely within one band of lowland?
+///
+/// `min_cls` is what makes this two different questions. Everything carved
+/// becomes water or sand, so if the disc plus a cell of margin is grass or
+/// lower, every untouched cell touching the new sand is grass, sand or water
+/// -- all legal next to sand, which is the whole point.
+///
+/// But for a *lake* that is not enough, because water is class 0 and so passes
+/// the same test. Every lake was being placed with the sea inside its disc, the
+/// carve joined it to the ocean, and a flood fill from the border found no
+/// inland water at all in any seed: 38 "lakes" that were all bays. A lake has
+/// to be dry ground first, so lakes pass SAND and only rivers, which are meant
+/// to reach the water, pass SHALLOW.
+fn discIsLowland(x: i32, y: i32, r: i32, min_cls: u8) bool {
+    const lim: i32 = r + 1;
+    const lim2: i32 = lim * lim + 1;
+    // Offset iteration rather than a signed range: this Zig wants the range of
+    // a `for` to be unsigned, and a negative start is the whole point here.
+    const span: usize = @intCast(lim * 2 + 1);
+    for (0..span) |iy| for (0..span) |ix| {
+        const dy: i32 = @as(i32, @intCast(iy)) - lim;
+        const dx: i32 = @as(i32, @intCast(ix)) - lim;
+        if (dx * dx + dy * dy > lim2) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 or ny < 0 or nx >= MAP_W or ny >= MAP_H) return false;
+        const i: usize = @intCast(@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx)));
+        const c = wantClass(heightAt(i));
+        if (c > GRASS or c < min_cls) return false;
+    };
+    return true;
+}
+
+/// A lake: water in the middle, a sand bank around it. The bank is not
+/// decoration -- it is the only thing that makes the water legal, and it falls
+/// out of the radial profile rather than being drawn on afterwards.
+fn carveLake(x: i32, y: i32, r: i32, salt: u32) void {
+    // The bank is kept to about a fifth of the radius. It has to be at least
+    // one tile -- water may only touch sand -- but a wide one reads as a sand
+    // flat rather than as a shore, and it is a big visible cost for a rule that
+    // is only there to keep the adjacency solvable.
+    const inner: i32 = @divTrunc(r * 80, 100);
+    const inner2 = inner * inner;
+    const r2 = r * r;
+    const span: usize = @intCast(r * 2 + 1);
+    for (0..span) |iy| for (0..span) |ix| {
+        const dy: i32 = @as(i32, @intCast(iy)) - r;
+        const dx: i32 = @as(i32, @intCast(ix)) - r;
+        // A wobble on the radius, so the outline is a lake and not a disc. It
+        // is hashed from the cell rather than drawn from a stream, so the shape
+        // does not depend on where in the carve it is evaluated.
+        const n = @as(f32, @floatFromInt(hash(@bitCast(@as(i32, x + dx)), @bitCast(@as(i32, y + dy)), salt) & 0xFF)) / 255.0;
+        const dd = @sqrt(@as(f32, @floatFromInt(dx * dx + dy * dy))) * (0.82 + 0.36 * n);
+        const d2: i32 = @intFromFloat(dd * dd);
+        if (d2 > r2) continue;
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 or ny < 0 or nx >= MAP_W or ny >= MAP_H) continue;
+        const i: usize = @intCast(@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx)));
+        lowerTo(i, sea + (if (d2 <= inner2) LAKE_H else BANK_H));
+    };
+}
+
+/// Distance to open sea, in tiles, 255 for "no idea".
+///
+/// Two chamfer sweeps rather than a breadth-first search: a BFS wants a 200 KB
+/// queue, and nothing here needs to be exact -- a river only has to walk
+/// downhill on this and arrive. Three iterations, because a single pass leaves
+/// the field lumpy enough for a walk to stall in a local dip.
+///
+/// Seeded from cells genuinely below sea level, which is what separates the
+/// ocean from the lakes: a lake is carved to `sea + LAKE_H`, just *above* sea,
+/// so it gets a real distance to the water rather than reading as being at it.
+fn buildSeaDist(dist: *[CELLS]u8) void {
+    for (0..CELLS) |i| dist[i] = if (heightAt(i) < sea) 0 else 255;
+    for (0..3) |_| {
+        for (0..MAP_H) |y| for (0..MAP_W) |x| {
+            const i = y * MAP_W + x;
+            var d: u16 = dist[i];
+            if (x > 0) d = @min(d, @as(u16, dist[i - 1]) + 1);
+            if (y > 0) d = @min(d, @as(u16, dist[i - MAP_W]) + 1);
+            dist[i] = @intCast(@min(d, 255));
+        };
+        var y = MAP_H;
+        while (y > 0) {
+            y -= 1;
+            var x = MAP_W;
+            while (x > 0) {
+                x -= 1;
+                const i = y * MAP_W + x;
+                var d: u16 = dist[i];
+                // x stops at 1 and y at 0, so the right and bottom edges still
+                // need guarding: on the last row `i + 1` is one past the end.
+                if (y + 1 < MAP_H) {
+                    d = @min(d, @as(u16, dist[i + 1]) + 1);
+                    d = @min(d, @as(u16, dist[i + MAP_W]) + 1);
+                }
+                dist[i] = @intCast(@min(d, 255));
+            }
+        }
+    }
+}
+
+/// A river out of a lake, to the sea.
+///
+/// It walks the distance field rather than drawing a line, because that is what
+/// makes it a river: the field is the terrain's own fall line, so the channel
+/// follows the ground downhill and arrives at open water. Rivers that pass close
+/// to another lake join the two on the way past, which is the "connect the
+/// lakes" part, and it happens where the ground actually goes that way rather
+/// than wherever a straight line happened to fall.
+///
+/// No corridor test, and no bank. RIVER's neighbour whitelist lets a channel
+/// touch any terrain, which is the entire reason that tile exists -- the shallows
+/// needed a clear two-tile margin of lowland on both sides to stay legal, and
+/// there is almost nowhere on these maps that a river could cross forest.
+fn carveRiverToSea(cx0: i32, cy0: i32, r: i32, dist: *const [CELLS]u8, st: *u32) bool {
+    // Start from whichever cell of the lake is nearest the sea. Every cell
+    // inside a lake was carved to the same height, so starting at the centre
+    // means no neighbour is strictly nearer and the walk stalls in the water.
+    var sx = cx0;
+    var sy = cy0;
+    var best = dist[@intCast(@as(usize, @intCast(cy0)) * MAP_W + @as(usize, @intCast(cx0)))];
+    const span: usize = @intCast(r + 1);
+    for (0..span) |iy| for (0..span) |ix| {
+        const dx: i32 = @as(i32, @intCast(ix)) - r;
+        const dy: i32 = @as(i32, @intCast(iy)) - r;
+        if (dx * dx + dy * dy > r * r) continue;
+        const nx = cx0 + dx;
+        const ny = cy0 + dy;
+        if (nx < 1 or ny < 1 or nx >= @as(i32, @intCast(MAP_W)) - 1 or ny >= @as(i32, @intCast(MAP_H)) - 1) continue;
+        const d = dist[@intCast(@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx)))];
+        if (d < best) {
+            best = d;
+            sx = nx;
+            sy = ny;
+        }
+    };
+    if (best == 0) return false; // the lake is already open water
+
+    // 64 tiles is a stream, not a canal. A lake further than that from open water
+    // simply does not get one.
+    var path: [64]u16 = undefined;
+    var n: usize = 0;
+    var cx = sx;
+    var cy = sy;
+    while (n < path.len) {
+        const here = dist[@intCast(@as(usize, @intCast(cy)) * MAP_W + @as(usize, @intCast(cx)))];
+        if (here == 0) break;
+        var nx = cx;
+        var ny = cy;
+        var found = false;
+        for (0..4) |d| {
+            const ax = cx + DX[d];
+            const ay = cy + DY[d];
+            if (ax < 1 or ay < 1 or ax >= @as(i32, @intCast(MAP_W)) - 1 or ay >= @as(i32, @intCast(MAP_H)) - 1) continue;
+            const ni: usize = @intCast(@as(usize, @intCast(ay)) * MAP_W + @as(usize, @intCast(ax)));
+            if (dist[ni] < here) {
+                nx = ax;
+                ny = ay;
+                found = true;
+            }
+        }
+        if (!found) return false; // a local dip in the distance field
+        cx = nx;
+        cy = ny;
+        path[n] = @intCast(@as(usize, @intCast(cy)) * MAP_W + @as(usize, @intCast(cx)));
+        n += 1;
+    }
+    if (dist[@intCast(@as(usize, @intCast(cy)) * MAP_W + @as(usize, @intCast(cx)))] != 0) return false;
+
+    // The traced line is dead straight, because every step goes to the one
+    // neighbour that is strictly nearer the sea and that is almost always
+    // directly ahead. A river drawn with a ruler is a canal.
+    //
+    // So the line is only the *route*; the channel is the route pushed sideways
+    // along a smooth wobble, tapered to nothing at both ends so it still leaves
+    // the lake and still enters the sea where the route did. Rebuilding it cell
+    // by cell between displaced points is what keeps it 4-connected -- the
+    // offsets can leave a two-cell gap, and a river the wave function collapse
+    // cannot propagate along is a row of ponds.
+    //
+    // None of this needed a legality check. With RIVER's whitelist any path is
+    // legal, so the shape is a free choice now; only connectivity is not.
+    // Scaled to the river. A 5-tile swing on a 10-tile river is not a meander,
+    // it is a zigzag that crosses itself, and the crossing reads as a widening
+    // followed by a gap.
+    const amp: f32 = @min(4.5, @as(f32, @floatFromInt(n)) * 0.22);
+    const ph1 = @as(f32, @floatFromInt(carverRand(st) & 0xFFFF)) / 65535.0 * 6.2832;
+    const ph2 = @as(f32, @floatFromInt(carverRand(st) & 0xFFFF)) / 65535.0 * 6.2832;
+    const last: f32 = @floatFromInt(if (n <= 1) 1 else n - 1);
+
+    var prev_x = sx;
+    var prev_y = sy;
+    for (path[0..n], 0..) |c, i| {
+        const bx: i32 = @intCast(c % MAP_W);
+        const by: i32 = @intCast(c / MAP_W);
+        // local heading, from the previous traced point where there is one
+        const hx: f32 = if (i == 0) 1.0 else @as(f32, @floatFromInt(bx - @as(i32, @intCast(path[i - 1] % MAP_W))));
+        const hy: f32 = if (i == 0) 0.0 else @as(f32, @floatFromInt(by - @as(i32, @intCast(path[i - 1] / MAP_W))));
+        const t = @as(f32, @floatFromInt(i)) / last;
+        const taper = @sin(t * std.math.pi);
+        const wob = @sin(t * 9.1 + ph1) * 0.62 + @sin(t * 21.3 + ph2) * 0.38;
+        const off = amp * taper * wob;
+        // perpendicular to the heading
+        const ox = @as(i32, @intFromFloat(-hy * off));
+        const oy = @as(i32, @intFromFloat(hx * off));
+        var tx = bx + ox;
+        var ty = by + oy;
+        tx = std.math.clamp(tx, 1, @as(i32, @intCast(MAP_W)) - 2);
+        ty = std.math.clamp(ty, 1, @as(i32, @intCast(MAP_H)) - 2);
+        // Fill the gap one axis at a time. Interpolating both coordinates at
+        // once looks tidier and is wrong: it steps diagonally, and the collapse
+        // propagates on four neighbours, so a diagonal channel is a row of
+        // ponds as far as the wave is concerned. Every step here changes exactly
+        // one coordinate by one, which is what "connected" means to it.
+        while (prev_x != tx or prev_y != ty) {
+            const ddx: i32 = if (tx > prev_x) 1 else if (tx < prev_x) -1 else 0;
+            const ddy: i32 = if (ty > prev_y) 1 else if (ty < prev_y) -1 else 0;
+            const ax = @abs(tx - prev_x);
+            const ay = @abs(ty - prev_y);
+            // Whichever axis has further to go, so the staircase leans the way
+            // the channel is already running; ties flip on a coin so it does not
+            // come out as one long uniform set of steps.
+            if (ax > ay or (ax == ay and (carverRand(st) & 1) == 0)) {
+                prev_x += ddx;
+            } else {
+                prev_y += ddy;
+            }
+            const idx: usize = @intCast(@as(usize, @intCast(prev_y)) * MAP_W + @as(usize, @intCast(prev_x)));
+            lowerTo(idx, sea + LAKE_H);
+            if (river_count < river_cells.len) {
+                river_cells[river_count] = @intCast(idx);
+                river_count += 1;
+            }
+        }
+        prev_x = tx;
+        prev_y = ty;
+    }
+
+    return true;
+}
+
+/// Cut through the sand that stands between a channel and water it can reach.
+///
+/// A river that stops one tile short of the water and leaves a beach in between
+/// reads as a ditch that ran into sand. At (66,52) on 0xC0FFEE the column reads
+/// RIVER, BEACH, SHALLOW, where it plainly should read RIVER, RIVER, SHALLOWS --
+/// and the water on the far side is a lagoon, not the sea.
+///
+/// Which is why this is not keyed to the sea. My first version only cut the bar
+/// directly *downstream*, on the reasoning that a river running along a coast
+/// has beach on its seaward side the whole way and claiming all of it would
+/// gouge the shoreline. That reasoning was sound and the rule was wrong: at
+/// (66,52) the bar is 27 tiles from the sea and the river cell is 26, so the
+/// bar is *upstream* in the distance field and the rule never looked at it. A
+/// river has to reach the water next to it, not only the water it was walked
+/// toward.
+///
+/// The test is therefore local and direct: a sand tile with a river on one side
+/// and open water on another is a bar, and the river goes through it.
+fn clearRiverBars() void {
+    var at: usize = 0;
+    while (at < river_count) : (at += 1) {
+        const c: usize = river_cells[at];
+        const cx: i32 = @intCast(c % MAP_W);
+        const cy: i32 = @intCast(c / MAP_W);
+        for (0..4) |d| {
+            const bx = cx + DX[d];
+            const by = cy + DY[d];
+            if (bx < 1 or by < 1 or bx >= @as(i32, @intCast(MAP_W)) - 1 or by >= @as(i32, @intCast(MAP_H)) - 1) continue;
+            const bi: usize = @intCast(@as(usize, @intCast(by)) * MAP_W + @as(usize, @intCast(bx)));
+            if (wantClass(heightAt(bi)) != SAND) continue;
+            // is there water on the far side of this sand, not the river itself?
+            var reaches = false;
+            for (0..4) |e| {
+                const wx = bx + DX[e];
+                const wy = by + DY[e];
+                if (wx < 0 or wy < 0 or wx >= @as(i32, @intCast(MAP_W)) or wy >= @as(i32, @intCast(MAP_H))) continue;
+                if (wx == cx and wy == cy) continue;
+                const wi: usize = @intCast(@as(usize, @intCast(wy)) * MAP_W + @as(usize, @intCast(wx)));
+                if (wantClass(heightAt(wi)) <= SHALLOW) reaches = true;
+            }
+            if (!reaches) continue;
+            lowerTo(bi, sea + LAKE_H);
+            if (river_count >= river_cells.len) return;
+            river_cells[river_count] = @intCast(bi);
+            river_count += 1;
+        }
+    }
+}
+
+fn carveFeatures(s: u32) void {
+    var r: u32 = s ^ 0xCA21_E5;
+    lakes_placed = 0;
+    carved_cells = 0;
+    river_count = 0;
+
+    var guard: usize = 0;
+    while (lakes_placed < LAKE_TARGETS and guard < LAKE_TARGETS * 80) : (guard += 1) {
+        const x: i32 = @intCast(carverRand(&r) % MAP_W);
+        const y: i32 = @intCast(carverRand(&r) % MAP_H);
+        const rad = LAKE_R_MIN + @as(i32, @intCast(carverRand(&r) % @as(u32, LAKE_R_MAX - LAKE_R_MIN + 1)));
+        // Grass specifically, not merely "class 3 or below". Water is class 0
+        // and so passes a lowland test trivially, which meant lakes were being
+        // placed in the open sea: the carve had nothing to lower, the lake still
+        // counted as placed, and the budget went on no-ops until the lowlands
+        // were picked over. A lake has to start as dry ground.
+        if (wantClass(heightAt(@intCast(@as(usize, @intCast(y)) * MAP_W + @as(usize, @intCast(x))))) != GRASS) continue;
+        if (!discIsLowland(x, y, rad, SAND)) continue;
+        // Keep them apart, or the map fills with one lake wearing several hats
+        // and the count stops meaning anything.
+        var too_close = false;
+        for (0..lakes_placed) |k| {
+            const ddx = @as(i32, @intCast(lake_xy[k] >> 8)) - x;
+            const ddy = @as(i32, @intCast(lake_xy[k] & 0xFF)) - y;
+            if (ddx * ddx + ddy * ddy < 90) too_close = true;
+        }
+        if (too_close) continue;
+        carveLake(x, y, rad, s ^ 0x1A4E);
+        lake_xy[lakes_placed] = @as(u32, @intCast(x)) << 8 | @as(u32, @intCast(y));
+        lake_r[lakes_placed] = @intCast(rad);
+        lakes_placed += 1;
+    }
+
+    // One river per lake, walked down to the sea, so every lake on the map
+    // drains. A lake whose fall line stalls in a dip in the distance field is
+    // left without one rather than being given a channel that goes nowhere.
+    var dist: [CELLS]u8 = @splat(255);
+    buildSeaDist(&dist);
+    var made: usize = 0;
+    for (0..lakes_placed) |k| {
+        if (made >= RIVER_TARGETS) break;
+        if (carveRiverToSea(
+            @as(i32, @intCast(lake_xy[k] >> 8)),
+            @as(i32, @intCast(lake_xy[k] & 0xFF)),
+            @as(i32, lake_r[k]),
+            &dist,
+            &r,
+        )) made += 1;
+    }
+    clearRiverBars();
+    rivers_made = made;
 }
 
 // -- draw -------------------------------------------------------------------
@@ -1231,9 +1742,9 @@ fn draw() void {
         const ty = @divTrunc(cam_y, t_i) + @as(i32, @intCast(r));
         if (tx >= MAP_W or ty >= MAP_H) continue;
         const t = world[@as(usize, @intCast(ty)) * MAP_W + @as(usize, @intCast(tx))];
-        // only the sea animates; the alternate frame is a phase shift of the
-        // same noise, so the water rolls instead of strobing
-        const phase: usize = if (t <= SHALLOW) @intCast((tx + ty + (frame >> 4)) & 1) else 0;
+        // Only water animates; the alternate frame is a phase shift of the same
+        // noise, so the sea rolls instead of strobing.
+        const phase = animPhase(t, tx, ty, frame);
         // variant keyed off the map position, so it is stable as the camera
         // scrolls -- hashing the screen position would make the ground crawl
         const v: usize = @intCast(hash(@bitCast(tx), @bitCast(ty), 0x5A5A) % VARIANTS);
@@ -1259,10 +1770,44 @@ fn draw() void {
             if (nx < 0 or ny < 0 or nx >= MAP_W or ny >= MAP_H) continue;
             const nb = world[@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx))];
             if (nb == t) continue;
+            // A river owns no fade: the bank always draws it, so the water
+            // feathers outward and the channel keeps a solid edge. Note that a
+            // bank whose river is to the east or south reaches this loop and
+            // *does* draw, because the bank is the earlier tile there and owns
+            // the seam. Skipping `nb == RIVER` as well left those two sides with
+            // no fade at all, which is most of a channel's edge still cut.
+            if (t == RIVER) continue;
+
             // the band's blend texture has to be the variant the neighbour
             // actually draws, or every seam mismatches and the squares show
             const nv: usize = @intCast(hash(@bitCast(nx), @bitCast(ny), 0x5A5A) % VARIANTS);
             vex.blit(&BANDS[nb][dirSlot(d)][nv], sx, sy, t_i, t_i, 0); // 0 = transparent
+        }
+        // A river is one tile wide and a band is half a tile, so a fade drawn
+        // *into* the channel leaves about 8px of solid water between two banks
+        // of dither -- it read as a damp gully rather than a river. The fade
+        // belongs on the bank instead: every land tile with a river to its
+        // north or west draws the channel's art into its own edge, so the water
+        // feathers outward into the ground and the channel keeps a solid edge.
+        //
+        // Which is also why this is here and not in the loop above. Ownership of
+        // a seam goes to whichever tile is earlier in row-major order, so a
+        // river to the west or north owns that seam, and the bank cannot see it
+        // by looking east or south. It has to look back.
+        if (t != RIVER) {
+            for (RIVER_SIDES) |side| {
+                // DX/DY are already the offsets *to* the neighbour, so this is
+                // a plus. Written as a minus it looked south when it meant north
+                // and east when it meant west -- which drew a west-hugging band
+                // onto the east edge of the tile, and left the two sides where
+                // the river is earlier in scan order with no band at all.
+                const nx = tx + DX[side.d];
+                const ny = ty + DY[side.d];
+                if (nx < 0 or ny < 0 or nx >= MAP_W or ny >= MAP_H) continue;
+                if (world[@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx))] != RIVER) continue;
+                const nv: usize = @intCast(hash(@bitCast(nx), @bitCast(ny), 0x5A5A) % VARIANTS);
+                vex.blit(&RIVER_BANDS[side.slot][nv], sx, sy, t_i, t_i, 0);
+            }
         }
     };
 
@@ -2281,6 +2826,168 @@ test "every generating phrase fits, and the list is worth having" {
         if (seen_here) distinct += 1;
     }
     try std.testing.expect(distinct > 4);
+}
+
+test "the map has inland water, and the carver stays a garnish" {
+    _ = reset(0x51ED);
+    var guard: usize = 0;
+    while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+    try std.testing.expect(solved);
+
+    // Flood the water in from the border. Whatever is left is inland: a lake, a
+    // river, or a basin the noise made by itself.
+    var seen: [CELLS]bool = @splat(false);
+    var queue: [CELLS]u32 = undefined;
+    var qn: usize = 0;
+    var qh: usize = 0;
+    for (0..MAP_W * 2) |i| {
+        if (TILES[world[i]].cls > SHALLOW or seen[i]) continue;
+        seen[i] = true;
+        queue[qn] = @intCast(i);
+        qn += 1;
+    }
+    for (0..MAP_W) |x| {
+        const b = (MAP_H - 1) * MAP_W + x;
+        if (TILES[world[b]].cls > SHALLOW or seen[b]) continue;
+        seen[b] = true;
+        queue[qn] = @intCast(b);
+        qn += 1;
+    }
+    while (qh < qn) {
+        const cur = queue[qh];
+        qh += 1;
+        const cx: i32 = @intCast(cur % MAP_W);
+        const cy: i32 = @intCast(cur / MAP_W);
+        for (0..4) |d| {
+            const nx = cx + DX[d];
+            const ny = cy + DY[d];
+            if (nx < 0 or ny < 0 or nx >= @as(i32, @intCast(MAP_W)) or ny >= @as(i32, @intCast(MAP_H))) continue;
+            const n: usize = @intCast(@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx)));
+            if (seen[n] or TILES[world[n]].cls > SHALLOW) continue;
+            seen[n] = true;
+            queue[qn] = @intCast(n);
+            qn += 1;
+        }
+    }
+    var inland: usize = 0;
+    for (0..CELLS) |i| {
+        if (!seen[i] and TILES[world[i]].cls <= SHALLOW) inland += 1;
+    }
+
+    // A map with no inland water at all is the failure this exists for, and it
+    // was the real one. 38 "lakes" a map, every one placed with the sea inside
+    // its own disc, so the carve merged it into the ocean and the flood fill
+    // came back empty on all seven seeds. The renders looked fine throughout,
+    // which is the lesson: they showed bays.
+    try std.testing.expect(inland > CELLS / 1000);
+    try std.testing.expect(lakes_placed >= 4);
+
+    // The carve has to stay a garnish: 0.2% to 1.4% of the map over seven seeds.
+    // Counted, not inferred from inland water, because the noise throws up its
+    // own enclosed basins -- one seed has a lagoon over 11% of the map that has
+    // nothing to do with this feature, and bounding inland water called that
+    // too much carving.
+    try std.testing.expect(carved_cells > CELLS / 1000);
+    try std.testing.expect(carved_cells < CELLS / 8);
+}
+
+test "a river animates, and so does the sea it runs into" {
+    // Two halves, and the river needed both. `animPhase` decides which of a
+    // tile's two frames is drawn, and it read `t <= SHALLOW` -- RIVER is tile
+    // 11, so a channel sat perfectly still while the sea rippled around it.
+    // And `phase` drives nothing but the crest inside `tileArt`, which was
+    // gated to the same two kinds, so the river's two frames were byte for byte
+    // identical and there was nothing to animate even once the phase was right.
+    // Fixing one without the other still leaves a dead channel.
+    var river_moved: usize = 0;
+    var sea_moved: usize = 0;
+    for (0..VARIANTS) |v| {
+        for (TILES[RIVER].art[v][0], TILES[RIVER].art[v][1]) |a, b| {
+            if (a != b) river_moved += 1;
+        }
+        for (TILES[SHALLOW].art[v][0], TILES[SHALLOW].art[v][1]) |a, b| {
+            if (a != b) sea_moved += 1;
+        }
+    }
+    try std.testing.expect(river_moved > 0);
+    // A river is shallow water and takes the shallow crest, so it should move
+    // exactly as much as the sea rather than approximately.
+    try std.testing.expectEqual(sea_moved, river_moved);
+
+    // And it is handed a non-zero phase somewhere on the map, or the art
+    // difference would never be reached.
+    var alternates: usize = 0;
+    for (0..MAP_H) |y| for (0..MAP_W) |x| {
+        if (animPhase(RIVER, @intCast(x), @intCast(y), 0) != 0) alternates += 1;
+    };
+    try std.testing.expect(alternates > MAP_W * MAP_H / 4);
+
+    // Land still holds frame 0. The river joining the water must not drag the
+    // hills along with it.
+    for ([_]u8{ GRASS, FOREST, ROCK, SAND, RUINS }) |t| {
+        try std.testing.expectEqual(@as(usize, 0), animPhase(t, 3, 5, 0));
+        try std.testing.expectEqual(@as(usize, 0), animPhase(t, 4, 4, 0));
+    }
+}
+
+test "rivers reach the ocean" {
+    _ = reset(0x7A3F);
+    var guard: usize = 0;
+    while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+    try std.testing.expect(solved);
+    try std.testing.expect(river_count > 0);
+    try std.testing.expect(rivers_made > 0);
+
+    // The channel is pinned by mask, not chosen by weight, so it has to come
+    // through the solve intact.
+    for (river_cells[0..river_count]) |c| {
+        try std.testing.expectEqual(@as(u8, RIVER), world[c]);
+    }
+
+    // And every channel has to arrive. Flood the river tiles in from any that
+    // touch deep water; whatever the flood does not reach is a river that ends
+    // in a field, which is the whole complaint this was built to answer.
+    var seen: [CELLS]bool = @splat(false);
+    var queue: [CELLS]u32 = undefined;
+    var qn: usize = 0;
+    var qh: usize = 0;
+    var mouths: usize = 0;
+    for (river_cells[0..river_count]) |c| {
+        const cx: i32 = @intCast(c % MAP_W);
+        const cy: i32 = @intCast(c / MAP_W);
+        for (0..4) |d| {
+            const nx = cx + DX[d];
+            const ny = cy + DY[d];
+            if (nx < 0 or ny < 0 or nx >= @as(i32, @intCast(MAP_W)) or ny >= @as(i32, @intCast(MAP_H))) continue;
+            if (TILES[world[@intCast(@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx)))]].cls != DEEP) continue;
+            mouths += 1;
+            if (!seen[c]) {
+                seen[c] = true;
+                queue[qn] = c;
+                qn += 1;
+            }
+        }
+    }
+    try std.testing.expect(mouths > 0);
+    while (qh < qn) {
+        const cur = queue[qh];
+        qh += 1;
+        const cx: i32 = @intCast(cur % MAP_W);
+        const cy: i32 = @intCast(cur / MAP_W);
+        for (0..4) |d| {
+            const nx = cx + DX[d];
+            const ny = cy + DY[d];
+            if (nx < 0 or ny < 0 or nx >= @as(i32, @intCast(MAP_W)) or ny >= @as(i32, @intCast(MAP_H))) continue;
+            const n: usize = @intCast(@as(usize, @intCast(ny)) * MAP_W + @as(usize, @intCast(nx)));
+            if (seen[n] or world[n] != RIVER) continue;
+            seen[n] = true;
+            queue[qn] = @intCast(n);
+            qn += 1;
+        }
+    }
+    for (river_cells[0..river_count]) |c| {
+        try std.testing.expect(seen[c]);
+    }
 }
 
 test "the height encoding window holds the whole field" {
