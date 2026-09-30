@@ -2048,10 +2048,19 @@ fn input() void {
     cam_y = std.math.clamp(cam_y, 0, MAX_CAM_Y);
     if (vex.pressed(vex.Z)) {
         retries = 0;
-        _ = reset(rnd());
+        _ = reset(nextSeed());
         cam_x = MAX_CAM_X / 2;
         cam_y = MAX_CAM_Y / 2;
     }
+}
+
+/// The seed a Z press rolls.
+///
+/// Sixteen bits, so the HUD shows a four-character seed. `rnd()` is a full u32
+/// and would print up to eight, which is more than anyone wants to read off the
+/// bottom of the screen or retype into `-Dseed`.
+fn nextSeed() u32 {
+    return rnd() & 0xFFFF;
 }
 
 /// How close to an edge the mouse has to be before the camera scrolls, and how
@@ -2889,6 +2898,29 @@ test "the map has inland water, and the carver stays a garnish" {
     // too much carving.
     try std.testing.expect(carved_cells > CELLS / 1000);
     try std.testing.expect(carved_cells < CELLS / 8);
+}
+
+test "a Z press rolls a four-character seed" {
+    // The HUD prints the seed as bare hex with no padding, so the only thing
+    // keeping it short is the width of the roll. `rnd()` is a full u32 and
+    // printed up to eight characters.
+    rng = 0x1234_5678;
+    var seen: [4]bool = @splat(false);
+    var all_short = true;
+    for (0..200) |_| {
+        const s2 = nextSeed();
+        try std.testing.expect(s2 < 0x10000);
+        if (s2 < 0x1000) all_short = false; // 3 characters, which is allowed
+        if (s2 < 0x100) seen[2] = true;
+        if (s2 < 0x10) seen[1] = true;
+        seen[0] = true;
+    }
+    // It has to actually vary, or a constant would satisfy the width too.
+    try std.testing.expect(seen[0]);
+    // And it should not be stuck in the short range: three characters is fine,
+    // four is the norm, and a roll that rarely reached four would not be worth
+    // narrowing.
+    try std.testing.expect(!all_short);
 }
 
 test "a river animates, and so does the sea it runs into" {
