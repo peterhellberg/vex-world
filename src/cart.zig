@@ -144,8 +144,6 @@ const GENERATE_PER_FRAME: usize = @max(64, CELLS / 16);
 
 // -- tiles ------------------------------------------------------------------
 
-const Kind = enum(u8) { deep, shallow, sand, grass, forest, forest_deep, rock, barrens, peak, snow, ruins, river };
-
 const DEEP: u8 = 0;
 const SHALLOW: u8 = 1;
 const SAND: u8 = 2;
@@ -185,7 +183,6 @@ const VARIANTS: usize = 8;
 /// touch the tiles in it. Everything else falls back to the class rule, so
 /// plain terrain blends by elevation while ruins stay put.
 const Tile = struct {
-    kind: Kind,
     cls: u8, // elevation band: neighbouring classes must be within 1
     weight: u16, // relative pick weight once a cell collapses
     only: u16, // 0 = use the class rule
@@ -209,16 +206,16 @@ const RUIN_ODDS: usize = 900;
 
 const TILES: [TILE_COUNT]Tile = blk: {
     var list: [TILE_COUNT]Tile = .{
-        .{ .kind = .deep, .cls = 0, .weight = 6, .only = 0, .name = "DEEP SEA", .map = C.water_deep },
-        .{ .kind = .shallow, .cls = 1, .weight = 6, .only = 0, .name = "SHALLOWS", .map = C.water },
-        .{ .kind = .sand, .cls = 2, .weight = 5, .only = 0, .name = "BEACH", .map = C.sand },
-        .{ .kind = .grass, .cls = 3, .weight = 100, .only = 0, .name = "PLAINS", .map = C.grass },
-        .{ .kind = .forest, .cls = 4, .weight = 8, .only = 0, .name = "FOREST", .map = C.forest },
-        .{ .kind = .forest_deep, .cls = 5, .weight = 6, .only = 0, .name = "DEEP FOREST", .map = C.forest_deep },
-        .{ .kind = .rock, .cls = 6, .weight = 4, .only = 0, .name = "HIGHLANDS", .map = C.rock },
-        .{ .kind = .barrens, .cls = 7, .weight = 3, .only = 0, .name = "BARRENS", .map = C.barrens },
-        .{ .kind = .peak, .cls = 8, .weight = 2, .only = 0, .name = "PEAKS", .map = C.peak },
-        .{ .kind = .snow, .cls = 9, .weight = 2, .only = 0, .name = "SNOWCAP", .map = C.snow },
+        .{ .cls = 0, .weight = 6, .only = 0, .name = "DEEP SEA", .map = C.water_deep },
+        .{ .cls = 1, .weight = 6, .only = 0, .name = "SHALLOWS", .map = C.water },
+        .{ .cls = 2, .weight = 5, .only = 0, .name = "BEACH", .map = C.sand },
+        .{ .cls = 3, .weight = 100, .only = 0, .name = "PLAINS", .map = C.grass },
+        .{ .cls = 4, .weight = 8, .only = 0, .name = "FOREST", .map = C.forest },
+        .{ .cls = 5, .weight = 6, .only = 0, .name = "DEEP FOREST", .map = C.forest_deep },
+        .{ .cls = 6, .weight = 4, .only = 0, .name = "HIGHLANDS", .map = C.rock },
+        .{ .cls = 7, .weight = 3, .only = 0, .name = "BARRENS", .map = C.barrens },
+        .{ .cls = 8, .weight = 2, .only = 0, .name = "PEAKS", .map = C.peak },
+        .{ .cls = 9, .weight = 2, .only = 0, .name = "SNOWCAP", .map = C.snow },
         // A landmark, not a terrain. Its class is 3 and its rarity is
         // RUIN_ODDS, but neither drives where one goes: pickTile rolls for it
         // before the class aim ever runs, precisely because aiming a landmark
@@ -229,7 +226,7 @@ const TILES: [TILE_COUNT]Tile = blk: {
         // building in the surf, and allowing it made the shoreline the most
         // likely place in the world to find one. RUINS is, so they still
         // gather into villages rather than standing alone.
-        .{ .kind = .ruins, .cls = 3, .weight = 1, .only = bit(GRASS) | bit(FOREST) | bit(FOREST_DEEP) | bit(RUINS) | bit(RIVER), .name = "RUINS", .map = C.roof },
+        .{ .cls = 3, .weight = 1, .only = bit(GRASS) | bit(FOREST) | bit(FOREST_DEEP) | bit(RUINS) | bit(RIVER), .name = "RUINS", .map = C.roof },
         // A channel, not a depth. `cls` is 1 only so the class arithmetic has
         // something to say; what actually governs it is `only`, which is every
         // tile in the game. Water may otherwise only touch sand, and sand only
@@ -240,7 +237,6 @@ const TILES: [TILE_COUNT]Tile = blk: {
         // A whitelist is how ruins gets to stand in a forest at all, and it is
         // the right tool here too. One tile wide, no bank, any terrain.
         .{
-            .kind = .river,
             .cls = 1,
             .weight = 1,
             .only = bit(DEEP) | bit(SHALLOW) | bit(SAND) | bit(GRASS) | bit(FOREST) |
@@ -250,8 +246,8 @@ const TILES: [TILE_COUNT]Tile = blk: {
             .map = C.water,
         },
     };
-    for (&list) |*t| for (0..2) |f| for (0..VARIANTS) |v| {
-        t.art[v][f] = tileArt(t.kind, f, v);
+    for (&list, 0..) |*t, b| for (0..2) |f| for (0..VARIANTS) |v| {
+        t.art[v][f] = tileArt(@intCast(b), f, v);
     };
     break :blk list;
 };
@@ -428,7 +424,7 @@ fn bandSource(other: u8, variant: usize) [NP]u8 {
     if (other != RUINS) return TILES[other].art[variant][0];
     var px: [NP]u8 = @splat(0);
     for (0..T) |yy| for (0..T) |xx| {
-        const n = hash(@intCast(xx), @intCast(yy), @as(u32, @intFromEnum(Kind.ruins)) * 977 +%
+        const n = hash(@intCast(xx), @intCast(yy), @as(u32, RUINS) * 977 +%
             @as(u32, @intCast(variant)) * 331 +% 1);
         px[yy * T + xx] = if (n % 19 == 0) C.grass_light else C.grass;
     };
@@ -513,11 +509,11 @@ const BANDS: [TILE_COUNT][BAND_DIRS.len][VARIANTS][NP]u8 = blk: {
     break :blk out;
 };
 
-fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) [NP]u8 {
+fn tileArt(comptime kind: u8, comptime phase: usize, comptime variant: usize) [NP]u8 {
     @setEvalBranchQuota(12_000_000);
     var px: [NP]u8 = @splat(0);
     for (0..T) |yy| for (0..T) |xx| {
-        const n = hash(@intCast(xx), @intCast(yy), @as(u32, @intFromEnum(kind)) * 977 +%
+        const n = hash(@intCast(xx), @intCast(yy), @as(u32, kind) * 977 +%
             @as(u32, @intCast(variant)) * 331 +% phase * 7 +% 1);
         // Noise for the wave itself, deliberately *not* seeded by `kind` or
         // `variant`: both water tiles have to break their crest along the same
@@ -530,7 +526,7 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
         // a phase-seeded one would make the texture shimmer with the wave. Fine
         // grain only works at low contrast -- which is why the forest's
         // three-tone dither passes and this did not.
-        const d = hash(xx, yy, 0xDEE9 +% @as(u32, @intFromEnum(kind)) * 13 +%
+        const d = hash(xx, yy, 0xDEE9 +% @as(u32, kind) * 13 +%
             @as(u32, @intCast(variant)) * 5);
         var c: u8 = 8;
         switch (kind) {
@@ -539,14 +535,14 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
             // paint meeting light paint. An earlier DEEP was flat 8, several
             // steps from SHALLOWS 9, and read as a void with lines drawn on it.
             // The mottle is what stops either of them looking like a solid fill.
-            .deep => c = if (d % 11 == 0) C.water_channel else if (d % 37 == 0) C.water_deepest else DEEP_BODY,
+            DEEP => c = if (d % 11 == 0) C.water_channel else if (d % 37 == 0) C.water_deepest else DEEP_BODY,
             // The river borrows the shallows' bitmap outright. It is the same
             // water at the same scale, and reusing the art means the wave check,
             // the shore blend and the palette-role test all treat it as what it
             // is without a second texture to keep in step.
-            .shallow, .river => c = if (d % 11 == 0) DEEP_BODY else if (d % 29 == 0) C.shoal else SHALLOW_BODY,
-            .sand => c = if (n % 17 == 0) C.sand_dark else if (n % 11 == 0) C.flower else C.sand,
-            .grass => c = if (n % 53 == 0) C.flower else if (n % 19 == 0) C.grass_light else C.grass,
+            SHALLOW, RIVER => c = if (d % 11 == 0) DEEP_BODY else if (d % 29 == 0) C.shoal else SHALLOW_BODY,
+            SAND => c = if (n % 17 == 0) C.sand_dark else if (n % 11 == 0) C.flower else C.sand,
+            GRASS => c = if (n % 53 == 0) C.flower else if (n % 19 == 0) C.grass_light else C.grass,
             // Forest is dither, not drawn crowns. An earlier version painted
             // round canopies, but any shape big enough to read as a tree is
             // also big enough that a per-tile variant tears it at the tile
@@ -561,9 +557,9 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
             // dark canopy a patch holds, and a per-pixel dither lays the pixels
             // down inside it. The dither breaks the block edges, the blocks give
             // the dither shade to vary across, and neither is visible alone.
-            .forest, .forest_deep => {
+            FOREST, FOREST_DEEP => {
                 const b = hash(xx / 2, yy / 2, 0x5EED +% @as(u32, @intCast(variant)) +%
-                    @as(u32, @intFromEnum(kind)) * 13);
+                    @as(u32, kind) * 13);
                 // how much of the patch is dark canopy: 7 is the shaded tone
                 const dark: u32 = switch (b % 3) {
                     0 => 8, // deep shade
@@ -574,7 +570,7 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
                 // canopy each patch carries, which is the point of the split:
                 // same texture, denser, so the eye reads "deeper into the
                 // trees" rather than "a different green appeared".
-                const d2: u32 = if (kind == .forest_deep) @min(dark + 4, 10) else dark;
+                const d2: u32 = if (kind == FOREST_DEEP) @min(dark + 4, 10) else dark;
                 c = if (n % 10 < d2) C.forest else C.forest_light;
                 // The deep tier also paints its own darker tone in the gaps
                 // the canopy does not cover. It has to: the tier was 84% plain
@@ -583,18 +579,18 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
                 // a deep forest that was far darker than the tile it stood for.
                 // The two have to agree, and the shadow is what makes the tier
                 // read as shade rather than as density alone.
-                if (kind == .forest_deep and n % 10 >= d2) c = C.forest_deep;
+                if (kind == FOREST_DEEP and n % 10 >= d2) c = C.forest_deep;
             },
             // Two rock tiers from one speckle, so the climb reads as one
             // material getting paler rather than two unrelated textures.
-            .rock, .barrens => {
+            ROCK, BARRENS => {
                 c = if (n % 13 == 0) C.rock_light else if (n % 19 == 0) C.rock_dark else C.rock;
                 // Barrens: paler, with the dark fissures thinning out. Named for
                 // bare wind-scoured ground above the treeline, which is what this
                 // draws. It was "HIGH SCREE", but scree is loose rock piled at
                 // the *foot* of a cliff -- it belongs below the highlands, not
                 // between them and the summits, which is where this tier sits.
-                if (kind == .barrens) c = if (n % 11 == 0) C.rock else C.barrens;
+                if (kind == BARRENS) c = if (n % 11 == 0) C.rock else C.barrens;
             },
             // Peaks are drawn, not speckled. Everything else in the set is
             // noise at three scales, and a mountain made of noise is just a
@@ -609,7 +605,7 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
             // triangle look like a solid with a top rather than a shape drawn on
             // a flat tile. Dark also inverts the value order, so the peak is
             // now the highest-contrast thing up there instead of the least.
-            .peak => {
+            PEAK => {
                 const vy: u32 = @intCast(yy);
                 const vx: u32 = @intCast(xx);
                 const ridges = 1 + hash(@intCast(variant), 7, 0xBEEF) % 2;
@@ -638,7 +634,7 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
                     c = if (vx >= cx) C.peak_lit else C.peak;
                 }
             },
-            .snow => c = if (n % 9 == 0) C.snow_shade else if (n % 23 == 0) C.snow_tint else C.snow,
+            SNOW => c = if (n % 9 == 0) C.snow_shade else if (n % 23 == 0) C.snow_tint else C.snow,
             // Ruins are the one tile in the set that is not noise, which made
             // them the one tile variants did nothing for: every ruin drew the
             // same house in the same place, so a village came out as a row of
@@ -646,7 +642,7 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
             // nothing has to line up with a neighbour across the tile edge, so
             // each gets its own plan. A building does get cut off at the edge
             // if it lands there, which is fine; it is a structure on a 16px plot.
-            .ruins => {
+            RUINS => {
                 c = if (n % 19 == 0) C.grass_light else C.grass;
                 switch (variant % 4) {
                     0 => { // cottage, gabled roof and a door
@@ -676,6 +672,7 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
                     },
                 }
             },
+            else => @compileError("tileArt: not a tile index"),
         }
         // The crest goes on top of the mottled body, for both water tiles, and
         // always along the same `crest` lines -- that shared wave is what makes
@@ -690,9 +687,9 @@ fn tileArt(comptime kind: Kind, comptime phase: usize, comptime variant: usize) 
         // water. It takes SHALLOW_CREST because it is shallow water, and it
         // takes the same `w` noise -- deliberately unseeded by kind -- so a
         // river meeting the sea breaks its crest along the same lines.
-        if (kind == .deep or kind == .shallow or kind == .river) {
+        if (kind == DEEP or kind == SHALLOW or kind == RIVER) {
             if (crest(xx, yy, phase) and w % 2 == 0) {
-                c = if (kind == .deep) DEEP_CREST else SHALLOW_CREST;
+                c = if (kind == DEEP) DEEP_CREST else SHALLOW_CREST;
             }
         }
         px[yy * T + xx] = c;
@@ -786,10 +783,12 @@ var height_salt: u32 = 0;
 
 /// The normalised height of cell `i`, as `wantClass` wants to see it.
 fn heightAt(i: usize) f32 {
-    const raw = @as(f32, @floatFromInt(hq[i])) / H_SCALE + H_LO;
-    const pk = @as(f32, @floatFromInt(peak_q)) / H_SCALE + H_LO;
-    return raw / pk;
+    return (@as(f32, @floatFromInt(hq[i])) / H_SCALE + H_LO) / pk_h;
 }
+
+/// The peak read back as a height. Hoisted out of `heightAt`: it is a constant
+/// of the world, and `heightAt` is called from inside every carving disc.
+var pk_h: f32 = 1;
 
 fn buildHeight(salt: u32) void {
     for (OCTAVES, 0..) |o, k| {
@@ -837,6 +836,7 @@ fn buildHeight(salt: u32) void {
     // The tallest cell still normalises to exactly 1.0, because the peak is
     // read back out of the same quantised units the field is stored in.
     peak_q = peak;
+    pk_h = @as(f32, @floatFromInt(peak)) / H_SCALE + H_LO;
     // Carving needs the normaliser, so it can only run once the peak is stored.
     carveFeatures(salt);
 }
@@ -1005,8 +1005,8 @@ fn drawOverview() void {
     vex.rectb(MAP_X + vx, MAP_Y + vy, vw, vh, C.ui_bright);
 
     vex.rect(0, HUD_Y, vex.WIDTH, vex.HEIGHT - HUD_Y, C.ui_bg);
-    vex.text(say("SEED {X}  MAP {d}x{d}", .{ seed, MAP_W, MAP_H }), 4, HUD_Y + 2, C.ui_text);
-    vex.text(HINT_MAP, 4, HUD_Y + 11, C.ui_dim);
+    vex.text(say("SEED {X}  MAP {d}x{d}", .{ seed, MAP_W, MAP_H }), HUD_MARGIN, HUD_Y + 2, C.ui_text);
+    vex.text(HINT_MAP, HUD_MARGIN, HUD_Y + 11, C.ui_dim);
 }
 
 // -- entropy buckets --------------------------------------------------------
@@ -1156,17 +1156,14 @@ fn propagate(start: usize) bool {
 /// ruins are both class 3) the weight decides, so ruins stay rare. Picking on
 /// weight alone gives a map of static, not a world.
 fn pickTile(i: usize, mask: u16) u8 {
-    if (wantClass(heightAt(i)) >= GRASS and (mask & bit(RUINS)) != 0 and rnd() % RUIN_ODDS == 0) {
-        return RUINS;
-    }
-    return pickTerrain(i, mask);
+    const want = wantClass(heightAt(i));
+    if (want >= GRASS and (mask & bit(RUINS)) != 0 and rnd() % RUIN_ODDS == 0) return RUINS;
+    return pickTerrain(want, mask);
 }
 
 /// The class-aimed pick, with ruins rolled separately in pickTile. Split out so
 /// the aim can be checked on its own, without a ruin roll landing on top of it.
-fn pickTerrain(i: usize, mask: u16) u8 {
-    const want = wantClass(heightAt(i));
-
+fn pickTerrain(want: u8, mask: u16) u8 {
     // Ruins are a landmark, not a terrain, and are not chosen by elevation at
     // all. They used to be picked by the class rule below, which meant they
     // could only ever win where the field wanted their class -- and a wanted
@@ -1208,9 +1205,8 @@ fn pickTerrain(i: usize, mask: u16) u8 {
     return @intCast(@ctz(pool));
 }
 
-/// Start a new world. Returns non-zero if a seed ever fails to pin the sea
-/// ring, which would be a bug in the tile rules rather than a dead end.
-fn reset(s: u32) u32 {
+/// Start a new world.
+fn reset(s: u32) void {
     seed = s;
     rng = s | 1;
     height_salt = s;
@@ -1252,29 +1248,28 @@ fn reset(s: u32) u32 {
     // edge. The map edge is a viewport edge, not a coastline, so terrain is
     // free to run off it.
     solved = false;
-    return 0;
 }
 
 /// Collapse up to `budget` cells, or until the map is decided / a dead end
-/// turns up. Returns the seed of a finished world, 0 if there is still work.
-fn solve(budget: usize) u32 {
+/// turns up. Whether it finished is `solved`, which it sets as a side effect.
+fn solve(budget: usize) void {
     var n = budget;
     while (n > 0) {
         n -= 1;
         const c = pickCell() orelse {
             for (0..CELLS) |i| world[i] = @intCast(@ctz(masks[i]));
             solved = true;
-            return seed;
+            return;
         };
         masks[c] = @as(u16, 1) << @intCast(pickTile(c, masks[c]));
         bucketRequeue(c, 1); // decided: off the lists
         if (!propagate(c)) {
             // Dead end: a seed always dies the same way, so re-roll from it.
             retries += 1;
-            return reset(seed +% retries *% 0x9E3779B9);
+            reset(seed +% retries *% 0x9E3779B9);
+            return;
         }
     }
-    return 0;
 }
 
 // -- lakes and rivers -------------------------------------------------------
@@ -1335,8 +1330,7 @@ fn carverRand(st: *u32) u32 {
 
 /// The stored value that reads back as normalised height `h`.
 fn qFor(h: f32) u16 {
-    const pk = @as(f32, @floatFromInt(peak_q)) / H_SCALE + H_LO;
-    return @intFromFloat(std.math.clamp(((h * pk) - H_LO) * H_SCALE, 0, 65535));
+    return @intFromFloat(std.math.clamp(((h * pk_h) - H_LO) * H_SCALE, 0, 65535));
 }
 
 /// Carve down to `h`, never up. Raising would invent land, and a lake that
@@ -1846,8 +1840,8 @@ fn draw() void {
     drawMinimap();
 
     vex.rect(0, HUD_Y, vex.WIDTH, vex.HEIGHT - HUD_Y, C.ui_bg);
-    vex.text(say("SEED {X}  {d},{d}  {s}", .{ seed, hx, hy, TILES[hover].name }), 4, HUD_Y + 2, C.ui_text);
-    vex.text(HINT_SCROLL, 4, HUD_Y + 11, C.ui_dim);
+    vex.text(say("SEED {X}  {d},{d}  {s}", .{ seed, hx, hy, TILES[hover].name }), HUD_MARGIN, HUD_Y + 2, C.ui_text);
+    vex.text(HINT_SCROLL, HUD_MARGIN, HUD_Y + 11, C.ui_dim);
 }
 
 fn drawMinimap() void {
@@ -2048,7 +2042,7 @@ fn input() void {
     cam_y = std.math.clamp(cam_y, 0, MAX_CAM_Y);
     if (vex.pressed(vex.Z)) {
         retries = 0;
-        _ = reset(nextSeed());
+        reset(nextSeed());
         cam_x = MAX_CAM_X / 2;
         cam_y = MAX_CAM_Y / 2;
     }
@@ -2158,7 +2152,7 @@ fn edgeScroll(m: i32, extent: i32) i32 {
 export fn boot() void {
     vex.title("vex-world");
     for (PALETTE, 0..) |rgb, i| vex.pal(@intCast(i), @bitCast(rgb));
-    _ = reset(seed);
+    reset(seed);
     cam_x = MAX_CAM_X / 2;
     cam_y = MAX_CAM_Y / 2;
 }
@@ -2166,7 +2160,7 @@ export fn boot() void {
 export fn update() void {
     frame += 1;
     input();
-    if (!solved) _ = solve(GENERATE_PER_FRAME);
+    if (!solved) solve(GENERATE_PER_FRAME);
     draw();
 }
 
@@ -2179,9 +2173,9 @@ export fn update() void {
 
 test "a solved world obeys every adjacency rule" {
     for (0..4) |trial| {
-        try std.testing.expectEqual(@as(u32, 0), reset(0xC0FFEE +% @as(u32, @intCast(trial))));
+        reset(0xC0FFEE +% @as(u32, @intCast(trial)));
         var guard: usize = 0;
-        while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+        while (!solved and guard < 100) : (guard += 1) solve(CELLS);
         try std.testing.expect(solved);
         for (0..MAP_H) |y| for (0..MAP_W) |x| {
             const i = y * MAP_W + x;
@@ -2196,9 +2190,9 @@ test "a solved world obeys every adjacency rule" {
 test "the same seed always collapses to the same world" {
     var first: [CELLS]u8 = undefined;
     for (0..2) |pass| {
-        _ = reset(0x1234_5678);
+        reset(0x1234_5678);
         var guard: usize = 0;
-        while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+        while (!solved and guard < 100) : (guard += 1) solve(CELLS);
         try std.testing.expect(solved);
         if (pass == 0) first = world else try std.testing.expectEqualSlices(u8, &first, &world);
     }
@@ -2239,17 +2233,17 @@ test "the per-frame collapse budget does not change the world" {
     // Checked across seeds that all settle without a retry as well as ones
     // that might not, so this is not an artefact of the easy path.
     for ([_]u32{ 0x51ED, 0x7A3F, 0x2C91, 0xFEED, 0x1234, 0xABCD, 0xC0FFEE, 0, 1, 0xFFFF }) |s| {
-        _ = reset(s);
+        reset(s);
         var guard: usize = 0;
-        while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+        while (!solved and guard < 100) : (guard += 1) solve(CELLS);
         try std.testing.expect(solved);
         var one_shot: [CELLS]u8 = undefined;
         @memcpy(&one_shot, &world);
         const one_shot_seed = seed;
 
-        _ = reset(s);
+        reset(s);
         guard = 0;
-        while (!solved and guard < 2000) : (guard += 1) _ = solve(GENERATE_PER_FRAME);
+        while (!solved and guard < 2000) : (guard += 1) solve(GENERATE_PER_FRAME);
         try std.testing.expect(solved);
         // A retry lands on a different world entirely, so compare the seed the
         // solve ended on too, not just the tiles.
@@ -2269,9 +2263,9 @@ test "the adjacency table is symmetric and never empty" {
 }
 
 test "propagation only ever removes options, never adds them" {
-    _ = reset(0xABCD);
+    reset(0xABCD);
     const before = masks;
-    _ = solve(1);
+    solve(1);
     var narrowed: usize = 0;
     for (0..CELLS) |i| {
         try std.testing.expect(masks[i] & before[i] == masks[i]);
@@ -2283,7 +2277,7 @@ test "propagation only ever removes options, never adds them" {
 }
 
 test "the picked tile is allowed and as close to the aim as possible" {
-    _ = reset(0x99);
+    reset(0x99);
     for (0..CELLS) |i| {
         // An unrestricted cell: the aim alone decides the class -- except where
         // the ruin roll fires, which is a deliberate exception rather than the
@@ -2294,7 +2288,7 @@ test "the picked tile is allowed and as close to the aim as possible" {
         const t_free = if (wantClass(heightAt(i)) >= GRASS and rnd() % RUIN_ODDS == 0)
             RUINS
         else
-            pickTerrain(i, ALL_TILES);
+            pickTerrain(wantClass(heightAt(i)), ALL_TILES);
         if (t_free == RUINS) continue;
         try std.testing.expectEqual(TILES[t_free].cls, wantClass(heightAt(i)));
 
@@ -2838,9 +2832,9 @@ test "every generating phrase fits, and the list is worth having" {
 }
 
 test "the map has inland water, and the carver stays a garnish" {
-    _ = reset(0x51ED);
+    reset(0x51ED);
     var guard: usize = 0;
-    while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+    while (!solved and guard < 100) : (guard += 1) solve(CELLS);
     try std.testing.expect(solved);
 
     // Flood the water in from the border. Whatever is left is inland: a lake, a
@@ -2963,9 +2957,9 @@ test "a river animates, and so does the sea it runs into" {
 }
 
 test "rivers reach the ocean" {
-    _ = reset(0x7A3F);
+    reset(0x7A3F);
     var guard: usize = 0;
-    while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+    while (!solved and guard < 100) : (guard += 1) solve(CELLS);
     try std.testing.expect(solved);
     try std.testing.expect(river_count > 0);
     try std.testing.expect(rivers_made > 0);
@@ -3035,7 +3029,7 @@ test "the height encoding window holds the whole field" {
     // So this asserts the thing itself rather than its symptom: nothing sits on
     // either end stop, and the peak is strictly inside the window.
     for ([_]u32{ 0x51ED, 0x7A3F, 0x2C91, 0xFEED, 0x1234, 0xABCD, 0xC0FFEE }) |s| {
-        _ = reset(s);
+        reset(s);
         try std.testing.expect(peak_q > 0 and peak_q < 65535);
         for (hq) |q| {
             try std.testing.expect(q != 0);
@@ -3059,9 +3053,9 @@ test "every elevation tier gets a visible share of the land" {
     var counts: [TILE_COUNT]u32 = @splat(0);
     var total: u32 = 0;
     for (seeds) |s| {
-        _ = reset(s);
+        reset(s);
         var guard: usize = 0;
-        while (!solved and guard < 100) : (guard += 1) _ = solve(CELLS);
+        while (!solved and guard < 100) : (guard += 1) solve(CELLS);
         for (0..CELLS) |i| {
             counts[world[i]] += 1;
             total += 1;
@@ -3196,9 +3190,9 @@ test "ruins are rare, spread across the land, and never on the beach" {
     var want_hist: [TILE_COUNT]u32 = @splat(0);
     var on_sand: u32 = 0;
     for (seeds) |s| {
-        _ = reset(s);
+        reset(s);
         var guard: usize = 0;
-        while (!solved and guard < 200) : (guard += 1) _ = solve(CELLS);
+        while (!solved and guard < 200) : (guard += 1) solve(CELLS);
         try std.testing.expect(solved);
         per_map = 0;
         for (0..CELLS) |i| {
